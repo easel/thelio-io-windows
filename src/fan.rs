@@ -62,19 +62,19 @@ impl FanCurve {
         self
     }
 
-    /// The standard fan curve
+    /// The standard fan curve - gradual with wide temperature bands to minimize bouncing
     pub fn standard() -> Self {
         Self::default()
-            .append(44_99, 0_00)
-            .append(45_00, 30_00)
-            .append(55_00, 35_00)
-            .append(65_00, 40_00)
-            .append(75_00, 50_00)
-            .append(78_00, 60_00)
-            .append(81_00, 70_00)
-            .append(84_00, 80_00)
-            .append(86_00, 90_00)
-            .append(88_00, 100_00)
+            .append(59_99, 0_00)    // Fans off until 60°C
+            .append(60_00, 25_00)   // 25% at 60°C
+            .append(65_00, 30_00)   // 30% at 65°C
+            .append(70_00, 35_00)   // 35% at 70°C
+            .append(75_00, 45_00)   // 45% at 75°C
+            .append(80_00, 55_00)   // 55% at 80°C
+            .append(83_00, 63_00)   // 63% at 83°C
+            .append(85_00, 70_00)   // 70% at 85°C
+            .append(88_00, 85_00)   // 85% at 88°C
+            .append(90_00, 100_00)  // 100% at 90°C
     }
 
     /// Fan curve for threadripper 2

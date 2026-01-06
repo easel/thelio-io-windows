@@ -5,6 +5,7 @@ use std::{
 };
 
 pub mod fan;
+pub mod daemon;
 
 pub struct Io {
     port: Box<dyn serialport::SerialPort>,
