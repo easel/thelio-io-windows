@@ -112,15 +112,7 @@
                                 Id='exe1'
                                 Name='thelio-io_wrapper.exe'
                                 DiskId='1'
-                                Source='wrapper\bin\Release\net48\wrapper.exe'
-                                KeyPath='yes'/>
-                        </Component>
-                        <Component Id='binary2' Guid='*' Win64='$(var.Win64)'>
-                            <File
-                                Id='dll0'
-                                Name='OpenHardwareMonitorLib.dll'
-                                DiskId='1'
-                                Source='OpenHardwareMonitor\OpenHardwareMonitorLib.dll'
+                                Source='wrapper\bin\Release\net8.0-windows\win-x64\publish\wrapper.exe'
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
@@ -150,8 +142,6 @@
             <ComponentRef Id='binary0'/>
 
             <ComponentRef Id='binary1'/>
-
-            <ComponentRef Id='binary2'/>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>

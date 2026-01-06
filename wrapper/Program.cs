@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using OpenHardwareMonitor.Hardware;
+using LibreHardwareMonitor.Hardware;
 
 namespace wrapper
 {
@@ -12,9 +12,11 @@ namespace wrapper
         {
             bool debugMode = args.Length > 0 && args[0] == "--debug";
 
-            var c = new Computer();
-            c.CPUEnabled = true;
-            c.GPUEnabled = true;
+            var c = new Computer
+            {
+                IsCpuEnabled = true,
+                IsGpuEnabled = true
+            };
             c.Open();
 
             // Track max observed clock for throttle detection
@@ -42,7 +44,7 @@ namespace wrapper
                             Console.WriteLine($"  {h.HardwareType} | {s.SensorType} | {s.Name}: {v:F1}");
                         }
 
-                        if (h.HardwareType == HardwareType.CPU) {
+                        if (h.HardwareType == HardwareType.Cpu) {
                             // Temperature sensors
                             if (s.SensorType == SensorType.Temperature) {
                                 var v = s.Value ?? 0;
@@ -66,7 +68,7 @@ namespace wrapper
                             }
                         }
                         // Track GPU max separately
-                        else if (h.HardwareType == HardwareType.GpuNvidia || h.HardwareType == HardwareType.GpuAti) {
+                        else if (h.HardwareType == HardwareType.GpuNvidia || h.HardwareType == HardwareType.GpuAmd || h.HardwareType == HardwareType.GpuIntel) {
                             if (s.SensorType == SensorType.Temperature) {
                                 var v = s.Value ?? 0;
                                 if (v > gpuMax) {

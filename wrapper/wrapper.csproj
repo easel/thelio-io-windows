@@ -6,13 +6,15 @@
     <Copyright>GPL-3.0</Copyright>
     <AssemblyTitle>System76 Thelio Io Wrapper</AssemblyTitle>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net48</TargetFramework>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
     <ApplicationManifest>..\app.manifest</ApplicationManifest>
   </PropertyGroup>
 
   <ItemGroup>
-    <Reference Include="OpenHardwareMonitor">
-      <HintPath>..\OpenHardwareMonitor\OpenHardwareMonitorLib.dll</HintPath>
-    </Reference>
+    <PackageReference Include="LibreHardwareMonitorLib" Version="0.9.4" />
   </ItemGroup>
+
 </Project>

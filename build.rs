@@ -11,7 +11,7 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper/Program.cs");
     println!("cargo:rerun-if-changed=wrapper/wrapper.csproj");
     let status = Command::new("dotnet")
-        .arg("build")
+        .arg("publish")
         .arg("--configuration")
         .arg("Release")
         .current_dir("wrapper")
