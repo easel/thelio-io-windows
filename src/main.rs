@@ -21,7 +21,7 @@ use std::{
     time::Duration,
 };
 use thelio_io::{
-    fan::FanCurve,
+    fan::{FanCurve, FanController},
     Io,
 };
 use windows_service::{
@@ -41,7 +41,7 @@ use windows_service::{
     },
 };
 
-fn driver_loop(curve: &FanCurve, ios: &mut [Io], wrapper: &mut Child) -> io::Result<()> {
+fn driver_loop(controller: &mut FanController, ios: &mut [Io], wrapper: &mut Child) -> io::Result<()> {
     let mut wrapper_in = wrapper.stdin.take().unwrap();
     let mut wrapper_out = BufReader::new(wrapper.stdout.take().unwrap());
 
@@ -57,10 +57,22 @@ fn driver_loop(curve: &FanCurve, ios: &mut [Io], wrapper: &mut Child) -> io::Res
             )
         })?;
 
-        if let Some(duty) = curve.get_duty((temp * 100.0) as i16) {
+        let temp_hundredths = (temp * 100.0) as i16;
+        let output = controller.update(temp_hundredths);
+
+        // Only send commands to hardware when duty actually changes
+        if output.duty_changed {
+            debug!(
+                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({})",
+                output.instant_temp as f32 / 100.0,
+                output.smoothed_temp as f32 / 100.0,
+                output.actual_duty as f32 / 100.0,
+                output.reason
+            );
+
             for io in ios.iter_mut() {
                 for device in &["CPUF", "INTF"] {
-                    io.set_duty(device, duty).map_err(|err| {
+                    io.set_duty(device, output.actual_duty).map_err(|err| {
                         io::Error::new(
                             io::ErrorKind::Other,
                             err
@@ -144,6 +156,16 @@ fn driver() -> io::Result<()> {
         ));
     }
 
+    // Create fan controller with smoothing and hysteresis
+    // This prevents fan "panic" from short temperature spikes
+    let mut controller = FanController::new(curve)
+        .with_smoothing_window(5)      // 5 second temperature averaging
+        .with_ramp_up_delay(3.0)       // 3 second delay before speeding up
+        .with_ramp_down_delay(10.0)    // 10 second delay before slowing down
+        .with_min_duty_change(2_00);   // Ignore changes < 2%
+
+    debug!("Fan controller initialized with smoothing and hysteresis");
+
     let bin_path = current_exe()?;
     let bin_dir = bin_path.parent().unwrap();
     let wrapper_path = bin_dir.join("thelio-io_wrapper.exe");
@@ -152,7 +174,7 @@ fn driver() -> io::Result<()> {
         .stdout(Stdio::piped())
         .spawn()?;
 
-    let res = driver_loop(&curve, &mut ios, &mut wrapper);
+    let res = driver_loop(&mut controller, &mut ios, &mut wrapper);
 
     let _ = wrapper.kill();
 

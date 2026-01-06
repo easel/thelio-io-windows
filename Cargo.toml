@@ -16,3 +16,11 @@ windows-service = "0.3"
 
 [build-dependencies]
 winres = "0.1"
+
+[[bin]]
+name = "thelio-io"
+path = "src/main.rs"
+
+[[bin]]
+name = "thelio-io-cli"
+path = "src/cli.rs"
