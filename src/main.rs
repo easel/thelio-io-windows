@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::{
     ffi::OsString,
     io,
@@ -10,7 +10,7 @@ use std::{
 };
 use thelio_io::{
     daemon,
-    fan::{FanCurve, FanController},
+    fan::{FanCurve, FanController, ThrottleStatus},
 };
 use windows_service::{
     define_windows_service,
@@ -27,18 +27,65 @@ use windows_service::{
 };
 
 /// Logging callback for service mode
-struct LogCallback;
+struct LogCallback {
+    /// Track previous throttle status to avoid spamming logs
+    last_throttle_status: ThrottleStatus,
+}
+
+impl LogCallback {
+    fn new() -> Self {
+        Self {
+            last_throttle_status: ThrottleStatus::None,
+        }
+    }
+}
 
 impl daemon::DaemonCallback for LogCallback {
     fn on_update(&mut self, output: &thelio_io::fan::FanControllerOutput) {
+        // Log fan duty changes
         if output.duty_changed {
             debug!(
-                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({})",
+                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({}) [clock: {}/{}MHz, load: {:.1}%]",
                 output.instant_temp as f32 / 100.0,
                 output.smoothed_temp as f32 / 100.0,
                 output.actual_duty as f32 / 100.0,
-                output.reason
+                output.reason,
+                output.cpu_clock,
+                output.max_clock,
+                output.cpu_load,
             );
+        }
+
+        // Log throttle status changes
+        if output.throttle_status != self.last_throttle_status {
+            match output.throttle_status {
+                ThrottleStatus::None => {
+                    if self.last_throttle_status.is_throttling() {
+                        info!("Thermal throttling cleared - CPU clocks restored");
+                    }
+                }
+                ThrottleStatus::Likely => {
+                    warn!(
+                        "Possible thermal throttling detected: {:.1}C, clock {}/{}MHz ({:.0}%), load {:.1}%",
+                        output.instant_temp as f32 / 100.0,
+                        output.cpu_clock,
+                        output.max_clock,
+                        (output.cpu_clock as f32 / output.max_clock as f32) * 100.0,
+                        output.cpu_load,
+                    );
+                }
+                ThrottleStatus::Confirmed => {
+                    warn!(
+                        "THERMAL THROTTLING CONFIRMED: {:.1}C, clock {}/{}MHz ({:.0}%), load {:.1}%",
+                        output.instant_temp as f32 / 100.0,
+                        output.cpu_clock,
+                        output.max_clock,
+                        (output.cpu_clock as f32 / output.max_clock as f32) * 100.0,
+                        output.cpu_load,
+                    );
+                }
+            }
+            self.last_throttle_status = output.throttle_status;
         }
     }
 }
@@ -101,7 +148,7 @@ fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
     let mut wrapper = daemon::launch_wrapper()?;
 
     // Run the daemon loop
-    let mut callback = LogCallback;
+    let mut callback = LogCallback::new();
     let res = daemon::run_daemon(&mut controller, &mut ios, &mut wrapper, &stop_flag, &mut callback);
 
     let _ = wrapper.kill();

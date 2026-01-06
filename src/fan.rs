@@ -4,6 +4,139 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+/// Thermal throttling status
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ThrottleStatus {
+    /// No throttling detected
+    None,
+    /// Throttling likely - high load but clock significantly below max
+    Likely,
+    /// Throttling confirmed - sustained clock reduction under load
+    Confirmed,
+}
+
+impl ThrottleStatus {
+    /// Returns true if any throttling is detected
+    pub fn is_throttling(&self) -> bool {
+        !matches!(self, ThrottleStatus::None)
+    }
+}
+
+/// Sensor data from the hardware monitor wrapper
+#[derive(Clone, Debug, Default)]
+pub struct SensorData {
+    /// Temperature (hundredths of a degree, 8500 = 85.00C)
+    pub temp: i16,
+    /// Current average CPU clock in MHz
+    pub cpu_clock: u32,
+    /// Maximum observed CPU clock in MHz (approximates max boost)
+    pub max_clock: u32,
+    /// CPU load percentage (0-100)
+    pub cpu_load: f32,
+}
+
+impl SensorData {
+    /// Parse sensor data from JSON wrapper output
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        // Simple JSON parsing without serde dependency
+        let json = json.trim();
+
+        let temp = Self::extract_float(json, "temp")?;
+        let cpu_clock = Self::extract_int(json, "cpu_clock")?;
+        let max_clock = Self::extract_int(json, "max_clock")?;
+        let cpu_load = Self::extract_float(json, "cpu_load")?;
+
+        Ok(Self {
+            temp: (temp * 100.0) as i16,
+            cpu_clock: cpu_clock as u32,
+            max_clock: max_clock as u32,
+            cpu_load: cpu_load as f32,
+        })
+    }
+
+    fn extract_float(json: &str, key: &str) -> Result<f64, String> {
+        let pattern = format!("\"{}\":", key);
+        let start = json.find(&pattern)
+            .ok_or_else(|| format!("Key '{}' not found", key))?
+            + pattern.len();
+
+        let rest = &json[start..];
+        let end = rest.find(|c: char| c == ',' || c == '}')
+            .unwrap_or(rest.len());
+
+        rest[..end].trim().parse::<f64>()
+            .map_err(|e| format!("Failed to parse '{}': {}", key, e))
+    }
+
+    fn extract_int(json: &str, key: &str) -> Result<i64, String> {
+        let pattern = format!("\"{}\":", key);
+        let start = json.find(&pattern)
+            .ok_or_else(|| format!("Key '{}' not found", key))?
+            + pattern.len();
+
+        let rest = &json[start..];
+        let end = rest.find(|c: char| c == ',' || c == '}')
+            .unwrap_or(rest.len());
+
+        rest[..end].trim().parse::<i64>()
+            .map_err(|e| format!("Failed to parse '{}': {}", key, e))
+    }
+}
+
+/// Throttle detector with history tracking
+pub struct ThrottleDetector {
+    /// Number of consecutive samples showing throttle-like behavior
+    throttle_count: u32,
+    /// Threshold: clock must be this % below max to indicate throttling
+    clock_threshold_pct: f32,
+    /// Threshold: load must be above this % to consider throttling
+    load_threshold_pct: f32,
+    /// Samples needed to confirm throttling
+    confirm_samples: u32,
+}
+
+impl ThrottleDetector {
+    pub fn new() -> Self {
+        Self {
+            throttle_count: 0,
+            clock_threshold_pct: 85.0, // Clock below 85% of max = suspicious
+            load_threshold_pct: 70.0,  // Only check when load > 70%
+            confirm_samples: 3,        // 3 consecutive samples = confirmed
+        }
+    }
+
+    /// Analyze sensor data and return throttle status
+    pub fn analyze(&mut self, data: &SensorData) -> ThrottleStatus {
+        // Can't detect throttling without clock data
+        if data.max_clock == 0 {
+            return ThrottleStatus::None;
+        }
+
+        let clock_pct = (data.cpu_clock as f32 / data.max_clock as f32) * 100.0;
+        let is_under_load = data.cpu_load >= self.load_threshold_pct;
+        let clock_reduced = clock_pct < self.clock_threshold_pct;
+
+        if is_under_load && clock_reduced {
+            self.throttle_count += 1;
+
+            if self.throttle_count >= self.confirm_samples {
+                ThrottleStatus::Confirmed
+            } else {
+                ThrottleStatus::Likely
+            }
+        } else {
+            // Reset counter when conditions clear
+            self.throttle_count = 0;
+            ThrottleStatus::None
+        }
+    }
+
+    /// Reset the detector state
+    pub fn reset(&mut self) {
+        self.throttle_count = 0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FanPoint {
     // Temperature in hundredths of a degree, 10000 = 100C
@@ -188,6 +321,8 @@ pub struct FanController {
     ramp_down_delay_secs: f32,
     /// Minimum duty change to act on (prevents micro-adjustments)
     min_duty_change: u16,
+    /// Throttle detector for monitoring thermal throttling
+    throttle_detector: ThrottleDetector,
 }
 
 impl FanController {
@@ -209,6 +344,7 @@ impl FanController {
             ramp_up_delay_secs: 3.0,
             ramp_down_delay_secs: 10.0,
             min_duty_change: 2_00, // 2%
+            throttle_detector: ThrottleDetector::new(),
         }
     }
 
@@ -246,10 +382,26 @@ impl FanController {
         (sum / self.temp_history.len() as i32) as i16
     }
 
-    /// Update the controller with a new temperature reading.
-    /// Returns the duty cycle to set (if it should change) and debug info.
+    /// Update the controller with a new temperature reading (simple interface).
+    /// For full sensor data including throttle detection, use update_with_sensors().
     pub fn update(&mut self, temp: i16) -> FanControllerOutput {
+        let data = SensorData {
+            temp,
+            cpu_clock: 0,
+            max_clock: 0,
+            cpu_load: 0.0,
+        };
+        self.update_with_sensors(&data)
+    }
+
+    /// Update the controller with full sensor data including throttle detection.
+    /// Returns the duty cycle to set (if it should change) and debug info.
+    pub fn update_with_sensors(&mut self, data: &SensorData) -> FanControllerOutput {
         let now = Instant::now();
+        let temp = data.temp;
+
+        // Analyze throttle status
+        let throttle_status = self.throttle_detector.analyze(data);
 
         // Add to history, maintain window size
         self.temp_history.push_back(temp);
@@ -267,6 +419,10 @@ impl FanController {
             actual_duty: self.current_duty,
             duty_changed: false,
             reason: "holding",
+            throttle_status,
+            cpu_clock: data.cpu_clock,
+            max_clock: data.max_clock,
+            cpu_load: data.cpu_load,
         };
 
         // Calculate duty difference
@@ -362,6 +518,14 @@ pub struct FanControllerOutput {
     pub duty_changed: bool,
     /// Why we made this decision
     pub reason: &'static str,
+    /// Thermal throttle status
+    pub throttle_status: ThrottleStatus,
+    /// Current CPU clock in MHz
+    pub cpu_clock: u32,
+    /// Max observed CPU clock in MHz
+    pub max_clock: u32,
+    /// CPU load percentage
+    pub cpu_load: f32,
 }
 
 #[cfg(test)]
@@ -552,5 +716,125 @@ mod tests {
         let output = controller.update(70_00);
 
         assert_eq!(output.reason, "steady");
+    }
+
+    #[test]
+    fn test_sensor_data_from_json() {
+        let json = r#"{"temp":85.50,"cpu_clock":3200,"max_clock":4500,"cpu_load":95.25}"#;
+        let data = SensorData::from_json(json).unwrap();
+
+        assert_eq!(data.temp, 85_50); // 85.50C in hundredths
+        assert_eq!(data.cpu_clock, 3200);
+        assert_eq!(data.max_clock, 4500);
+        assert!((data.cpu_load - 95.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_sensor_data_from_json_integer_values() {
+        // Test with integer values (no decimal points)
+        let json = r#"{"temp":90,"cpu_clock":4000,"max_clock":4500,"cpu_load":50}"#;
+        let data = SensorData::from_json(json).unwrap();
+
+        assert_eq!(data.temp, 90_00);
+        assert_eq!(data.cpu_clock, 4000);
+        assert_eq!(data.max_clock, 4500);
+        assert!((data.cpu_load - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_throttle_detector_no_throttling() {
+        let mut detector = ThrottleDetector::new();
+
+        // Normal operation: high clock, any load
+        let data = SensorData {
+            temp: 70_00,
+            cpu_clock: 4300,
+            max_clock: 4500,
+            cpu_load: 50.0,
+        };
+        assert_eq!(detector.analyze(&data), ThrottleStatus::None);
+
+        // High load but clock still high
+        let data = SensorData {
+            temp: 85_00,
+            cpu_clock: 4200,
+            max_clock: 4500,
+            cpu_load: 95.0,
+        };
+        assert_eq!(detector.analyze(&data), ThrottleStatus::None);
+    }
+
+    #[test]
+    fn test_throttle_detector_likely_throttling() {
+        let mut detector = ThrottleDetector::new();
+
+        // High load with reduced clock
+        let data = SensorData {
+            temp: 90_00,
+            cpu_clock: 3000,  // 66% of max
+            max_clock: 4500,
+            cpu_load: 95.0,
+        };
+
+        // First sample - likely
+        assert_eq!(detector.analyze(&data), ThrottleStatus::Likely);
+    }
+
+    #[test]
+    fn test_throttle_detector_confirmed_throttling() {
+        let mut detector = ThrottleDetector::new();
+
+        let data = SensorData {
+            temp: 95_00,
+            cpu_clock: 2800,  // ~62% of max
+            max_clock: 4500,
+            cpu_load: 98.0,
+        };
+
+        // Need 3 consecutive samples to confirm
+        assert_eq!(detector.analyze(&data), ThrottleStatus::Likely);
+        assert_eq!(detector.analyze(&data), ThrottleStatus::Likely);
+        assert_eq!(detector.analyze(&data), ThrottleStatus::Confirmed);
+    }
+
+    #[test]
+    fn test_throttle_detector_clears_on_recovery() {
+        let mut detector = ThrottleDetector::new();
+
+        // Build up throttle state
+        let throttle_data = SensorData {
+            temp: 95_00,
+            cpu_clock: 2800,
+            max_clock: 4500,
+            cpu_load: 98.0,
+        };
+        detector.analyze(&throttle_data);
+        detector.analyze(&throttle_data);
+
+        // Now recover - clock returns to normal
+        let normal_data = SensorData {
+            temp: 70_00,
+            cpu_clock: 4400,
+            max_clock: 4500,
+            cpu_load: 30.0,
+        };
+        assert_eq!(detector.analyze(&normal_data), ThrottleStatus::None);
+
+        // Counter should be reset, so next throttle starts fresh
+        assert_eq!(detector.analyze(&throttle_data), ThrottleStatus::Likely);
+    }
+
+    #[test]
+    fn test_throttle_detector_no_data() {
+        let mut detector = ThrottleDetector::new();
+
+        // No clock data available
+        let data = SensorData {
+            temp: 90_00,
+            cpu_clock: 0,
+            max_clock: 0,
+            cpu_load: 95.0,
+        };
+        assert_eq!(detector.analyze(&data), ThrottleStatus::None);
     }
 }

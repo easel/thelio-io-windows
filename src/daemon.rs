@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{fan::{FanController, FanControllerOutput}, Io};
+use crate::{fan::{FanController, FanControllerOutput, SensorData, ThrottleStatus}, Io};
 
 /// All fan device headers on Thelio Io
 pub const FAN_DEVICES: &[&str] = &["CPUF", "INTF", "EXHF"];
@@ -116,19 +116,38 @@ impl DaemonCallback for ConsoleCallback {
         if self.first {
             println!("Starting fan control loop (Ctrl+C to stop)");
             println!("Smoothing: 5s window | Ramp-up: 3s delay | Ramp-down: 10s delay\n");
-            println!("{:>8} {:>8} {:>8} {:>8} {:>18}", "Instant", "Avg", "Target", "Actual", "State");
-            println!("{}", "-".repeat(62));
+            println!("{:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>18}",
+                "Instant", "Avg", "Target", "Actual", "Clock", "Load", "State");
+            println!("{}", "-".repeat(82));
             self.first = false;
         }
 
         let change_marker = if output.duty_changed { "*" } else { " " };
-        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {:>16}",
+
+        // Format throttle indicator
+        let throttle_indicator = match output.throttle_status {
+            ThrottleStatus::None => "",
+            ThrottleStatus::Likely => " [THROTTLE?]",
+            ThrottleStatus::Confirmed => " [THROTTLING]",
+        };
+
+        // Format clock as "current/max MHz" or empty if no data
+        let clock_str = if output.max_clock > 0 {
+            format!("{:>4}/{:<4}", output.cpu_clock, output.max_clock)
+        } else {
+            "   -    ".to_string()
+        };
+
+        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {} {:>5.1}% {:>16}{}",
             output.instant_temp as f32 / 100.0,
             output.smoothed_temp as f32 / 100.0,
             output.target_duty as f32 / 100.0,
             output.actual_duty as f32 / 100.0,
             change_marker,
-            output.reason
+            clock_str,
+            output.cpu_load,
+            output.reason,
+            throttle_indicator,
         );
     }
 }
@@ -149,17 +168,17 @@ pub fn run_daemon<C: DaemonCallback>(
     })?);
 
     while !stop_flag.load(Ordering::Relaxed) {
-        // Request temperature from wrapper
+        // Request sensor data from wrapper
         wrapper_in.write_all(b"\n")?;
         let mut line = String::new();
         wrapper_out.read_line(&mut line)?;
 
-        let temp = line.trim().parse::<f64>().map_err(|err| {
+        // Parse JSON sensor data from wrapper
+        let sensor_data = SensorData::from_json(&line).map_err(|err| {
             io::Error::new(io::ErrorKind::InvalidData, err)
         })?;
 
-        let temp_hundredths = (temp * 100.0) as i16;
-        let output = controller.update(temp_hundredths);
+        let output = controller.update_with_sensors(&sensor_data);
 
         // Notify callback
         callback.on_update(&output);
