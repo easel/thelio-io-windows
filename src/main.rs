@@ -135,9 +135,22 @@ fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
         .map(|v| v as f32)
         .unwrap_or(50.0); // Default 50% CPU
 
+    let cpu_power_threshold = read_registry_dword("CpuPowerThreshold")
+        .map(|v| v as f32)
+        .unwrap_or(95.0); // Default 95W
+
+    let gpu_temp_threshold = read_registry_dword("GpuTempThreshold")
+        .map(|v| (v as i16) * 100)
+        .unwrap_or(70_00); // Default 70°C
+
+    let critical_temp_offset = read_registry_dword("CriticalTempOffset")
+        .map(|v| (v as i16) * 100)
+        .unwrap_or(3_00); // Default +3°C
+
     info!(
-        "Fan settings: PBO={}°C, MaxFan={}%, Silence={}%, LoadThreshold={}%",
-        pbo_temp / 100, max_fan_duty / 100, silence_threshold / 100, sustained_load_threshold
+        "Fan settings: PBO={}°C, MaxFan={}%, Silence={}%, LoadThreshold={}%, PowerThreshold={}W, GpuTempThreshold={}°C, CriticalOffset=+{}°C",
+        pbo_temp / 100, max_fan_duty / 100, silence_threshold / 100, sustained_load_threshold,
+        cpu_power_threshold, gpu_temp_threshold / 100, critical_temp_offset / 100
     );
 
     // Create PBO-based fan curve
@@ -155,7 +168,10 @@ fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
         .with_pbo_temp(pbo_temp)
         .with_max_fan_duty(max_fan_duty)
         .with_silence_threshold(silence_threshold)
-        .with_sustained_load_threshold(sustained_load_threshold);
+        .with_sustained_load_threshold(sustained_load_threshold)
+        .with_cpu_power_threshold(cpu_power_threshold)
+        .with_gpu_temp_threshold(gpu_temp_threshold)
+        .with_critical_temp_offset(critical_temp_offset);
 
     debug!("Fan controller initialized with PBO-based curve");
 

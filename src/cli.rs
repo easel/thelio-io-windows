@@ -59,6 +59,9 @@ fn cmd_run(curve_name: &str) {
     let max_fan_duty = 100_00u16;
     let silence_threshold = 40_00u16;
     let sustained_load_threshold = 50.0f32;
+    let cpu_power_threshold = 95.0f32;
+    let gpu_temp_threshold = 70_00i16;
+    let critical_temp_offset = 3_00i16;
 
     let curve = match curve_name {
         "pbo" => {
@@ -99,7 +102,10 @@ fn cmd_run(curve_name: &str) {
         .with_pbo_temp(pbo_temp)
         .with_max_fan_duty(max_fan_duty)
         .with_silence_threshold(silence_threshold)
-        .with_sustained_load_threshold(sustained_load_threshold);
+        .with_sustained_load_threshold(sustained_load_threshold)
+        .with_cpu_power_threshold(cpu_power_threshold)
+        .with_gpu_temp_threshold(gpu_temp_threshold)
+        .with_critical_temp_offset(critical_temp_offset);
 
     // Find Thelio Io devices
     let mut ios = match daemon::find_thelio_io_devices() {

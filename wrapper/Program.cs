@@ -49,6 +49,9 @@ namespace wrapper
                 float gpuCoreClock = 0;
                 float gpuCoreLoad = 0;
 
+                // CPU power tracking for secondary fan trigger
+                float cpuPackagePower = 0;
+
                 foreach (var h in c.Hardware) {
                     h.Update();
                     foreach (var s in h.Sensors) {
@@ -92,6 +95,10 @@ namespace wrapper
                             // Total CPU load
                             else if (s.SensorType == SensorType.Load && s.Name == "CPU Total") {
                                 cpuTotalLoad = s.Value ?? 0;
+                            }
+                            // CPU package power for secondary fan trigger
+                            else if (s.SensorType == SensorType.Power && s.Name == "CPU Package") {
+                                cpuPackagePower = s.Value ?? 0;
                             }
                         }
                         // Track GPU metrics
@@ -169,6 +176,7 @@ namespace wrapper
                     Console.WriteLine($"  Core temps: [{string.Join(", ", cpuCoreTemps.Select(t => $"{t:F1}"))}]");
                     Console.WriteLine($"CPU clock: {avgCpuClock:F0} MHz (sustained max: {maxSustainedCpuClock:F0}, burst max: {maxBurstCpuClock:F0})");
                     Console.WriteLine($"CPU load: {cpuTotalLoad:F1}%");
+                    Console.WriteLine($"CPU power: {cpuPackagePower:F1}W");
                     Console.WriteLine($"GPU temp: {gpuTemp:F1}C from {gpuTempSource}");
                     Console.WriteLine($"GPU clock: {gpuCoreClock:F0} MHz (sustained max: {maxSustainedGpuClock:F0}, burst max: {maxBurstGpuClock:F0})");
                     Console.WriteLine($"GPU load: {gpuCoreLoad:F1}%");
@@ -177,8 +185,8 @@ namespace wrapper
                     // Output JSON for extended parsing (use invariant culture for consistent number formatting)
                     // cpu_max_clock uses sustained max (during high load) for better PBO-aware throttle detection
                     Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
-                        "{{\"temp\":{0:F2},\"cpu_temp\":{1:F2},\"cpu_clock\":{2},\"cpu_max_clock\":{3},\"cpu_load\":{4:F2},\"gpu_temp\":{5:F2},\"gpu_clock\":{6},\"gpu_max_clock\":{7},\"gpu_load\":{8:F2}}}",
-                        reportedTemp, cpuTemp, (int)avgCpuClock, (int)cpuMaxForThrottle, cpuTotalLoad,
+                        "{{\"temp\":{0:F2},\"cpu_temp\":{1:F2},\"cpu_clock\":{2},\"cpu_max_clock\":{3},\"cpu_load\":{4:F2},\"cpu_power\":{5:F2},\"gpu_temp\":{6:F2},\"gpu_clock\":{7},\"gpu_max_clock\":{8},\"gpu_load\":{9:F2}}}",
+                        reportedTemp, cpuTemp, (int)avgCpuClock, (int)cpuMaxForThrottle, cpuTotalLoad, cpuPackagePower,
                         gpuTemp, (int)gpuCoreClock, (int)gpuMaxForThrottle, gpuCoreLoad));
                 }
             }

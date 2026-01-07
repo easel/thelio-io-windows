@@ -35,6 +35,8 @@ pub struct SensorData {
     pub cpu_max_clock: u32,
     /// CPU load percentage (0-100)
     pub cpu_load: f32,
+    /// CPU package power in watts
+    pub cpu_power: f32,
     /// GPU temperature (hundredths of a degree)
     pub gpu_temp: i16,
     /// Current GPU core clock in MHz
@@ -56,6 +58,7 @@ impl SensorData {
         let cpu_clock = Self::extract_int(json, "cpu_clock")?;
         let cpu_max_clock = Self::extract_int(json, "cpu_max_clock")?;
         let cpu_load = Self::extract_float(json, "cpu_load")?;
+        let cpu_power = Self::extract_float(json, "cpu_power").unwrap_or(0.0);
         let gpu_temp = Self::extract_float(json, "gpu_temp")?;
         let gpu_clock = Self::extract_int(json, "gpu_clock")?;
         let gpu_max_clock = Self::extract_int(json, "gpu_max_clock")?;
@@ -67,6 +70,7 @@ impl SensorData {
             cpu_clock: cpu_clock as u32,
             cpu_max_clock: cpu_max_clock as u32,
             cpu_load: cpu_load as f32,
+            cpu_power: cpu_power as f32,
             gpu_temp: (gpu_temp * 100.0) as i16,
             gpu_clock: gpu_clock as u32,
             gpu_max_clock: gpu_max_clock as u32,
@@ -421,6 +425,12 @@ pub struct FanController {
     sustained_load_start: Option<Instant>,
     /// CPU load threshold for sustained load detection (0-100)
     sustained_load_threshold: f32,
+    /// CPU power threshold for secondary sustained load trigger (watts)
+    cpu_power_threshold: f32,
+    /// GPU temp threshold for secondary sustained load trigger (hundredths)
+    gpu_temp_threshold: i16,
+    /// Critical temp offset above PBO (hundredths, e.g., 3_00 = +3°C)
+    critical_temp_offset: i16,
 }
 
 impl FanController {
@@ -434,6 +444,9 @@ impl FanController {
     /// - Max fan duty: 100%
     /// - Silence threshold: 40%
     /// - Sustained load threshold: 50% CPU
+    /// - CPU power threshold: 95W
+    /// - GPU temp threshold: 70°C
+    /// - Critical temp offset: +3°C
     pub fn new(curve: FanCurve) -> Self {
         Self {
             curve,
@@ -448,6 +461,9 @@ impl FanController {
             silence_threshold: 40_00, // 40%
             sustained_load_start: None,
             sustained_load_threshold: 50.0, // 50% CPU
+            cpu_power_threshold: 95.0,      // 95W
+            gpu_temp_threshold: 70_00,      // 70°C
+            critical_temp_offset: 3_00,     // +3°C
         }
     }
 
@@ -494,6 +510,24 @@ impl FanController {
         self
     }
 
+    /// Configure CPU power threshold for secondary trigger (watts)
+    pub fn with_cpu_power_threshold(mut self, watts: f32) -> Self {
+        self.cpu_power_threshold = watts;
+        self
+    }
+
+    /// Configure GPU temp threshold for secondary trigger (hundredths)
+    pub fn with_gpu_temp_threshold(mut self, temp: i16) -> Self {
+        self.gpu_temp_threshold = temp;
+        self
+    }
+
+    /// Configure critical temp offset above PBO (hundredths)
+    pub fn with_critical_temp_offset(mut self, offset: i16) -> Self {
+        self.critical_temp_offset = offset;
+        self
+    }
+
     /// Get the smoothed (averaged) temperature
     fn smoothed_temp(&self) -> i16 {
         if self.temp_history.is_empty() {
@@ -512,6 +546,7 @@ impl FanController {
             cpu_clock: 0,
             cpu_max_clock: 0,
             cpu_load: 0.0,
+            cpu_power: 0.0,
             gpu_temp: 0,
             gpu_clock: 0,
             gpu_max_clock: 0,
@@ -533,8 +568,8 @@ impl FanController {
         let now = Instant::now();
         let temp = data.temp;
 
-        // Critical temperature = PBO + 2°C - bypass all delays for safety
-        let critical_temp = self.pbo_temp + 2_00;
+        // Critical temperature = PBO + offset - bypass all delays for safety
+        let critical_temp = self.pbo_temp + self.critical_temp_offset;
         if temp >= critical_temp {
             self.temp_history.push_back(temp);
             while self.temp_history.len() > self.smoothing_window {
@@ -558,6 +593,7 @@ impl FanController {
                 sustained_secs: 0.0,
                 cpu_temp: data.cpu_temp,
                 cpu_load: data.cpu_load,
+                cpu_power: data.cpu_power,
                 gpu_temp: data.gpu_temp,
                 gpu_load: data.gpu_load,
             };
@@ -576,8 +612,15 @@ impl FanController {
         // Check for sustained load condition: high CPU AND temp >= PBO temp
         let is_at_pbo_load = data.cpu_load >= self.sustained_load_threshold && smoothed_temp >= self.pbo_temp;
 
+        // Secondary triggers for case airflow (even when CPU is cool)
+        let is_high_power = data.cpu_power >= self.cpu_power_threshold;
+        let is_gpu_hot = data.gpu_temp >= self.gpu_temp_threshold;
+
+        // Trigger sustained load ramp if ANY condition is met
+        let needs_airflow = is_at_pbo_load || is_high_power || is_gpu_hot;
+
         // Track sustained load duration
-        let sustained_secs = if is_at_pbo_load {
+        let sustained_secs = if needs_airflow {
             match self.sustained_load_start {
                 Some(start) => now.duration_since(start).as_secs_f32(),
                 None => {
@@ -603,6 +646,7 @@ impl FanController {
             sustained_secs,
             cpu_temp: data.cpu_temp,
             cpu_load: data.cpu_load,
+            cpu_power: data.cpu_power,
             gpu_temp: data.gpu_temp,
             gpu_load: data.gpu_load,
         };
@@ -698,6 +742,8 @@ pub struct FanControllerOutput {
     pub cpu_temp: i16,
     /// CPU load percentage
     pub cpu_load: f32,
+    /// CPU power in watts
+    pub cpu_power: f32,
     /// GPU temperature (hundredths of a degree)
     pub gpu_temp: i16,
     /// GPU load percentage
@@ -812,6 +858,7 @@ mod tests {
             cpu_clock: 0,
             cpu_max_clock: 0,
             cpu_load: 50.0,  // Not 100% load
+            cpu_power: 0.0,
             gpu_temp: 60_00,
             gpu_clock: 0,
             gpu_max_clock: 0,
@@ -853,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_controller_critical_temp_override() {
-        // Critical temp = PBO + 2°C = 87°C
+        // Critical temp = PBO + 3°C = 88°C (default offset is +3)
         let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(5)  // Long smoothing
@@ -862,8 +909,8 @@ mod tests {
         // Start cold
         controller.update(40_00);
 
-        // Critical temp (87°C = PBO+2) should immediately jump to 100%
-        let output = controller.update(87_00);
+        // Critical temp (88°C = PBO+3) should immediately jump to 100%
+        let output = controller.update(88_00);
         assert!(output.duty_changed);
         assert_eq!(output.actual_duty, 100_00);
         assert_eq!(output.reason, "CRITICAL TEMP");
@@ -967,6 +1014,7 @@ mod tests {
             cpu_clock: 4300,  // 95.5% of max - above 92% threshold
             cpu_max_clock: 4500,
             cpu_load: 50.0,
+            cpu_power: 0.0,
             gpu_temp: 60_00,
             gpu_clock: 1900,  // 95% of max
             gpu_max_clock: 2000,
@@ -981,6 +1029,7 @@ mod tests {
             cpu_clock: 4200,  // 93.3% of max - above 92% threshold
             cpu_max_clock: 4500,
             cpu_load: 95.0,
+            cpu_power: 0.0,
             gpu_temp: 75_00,
             gpu_clock: 1900,  // 95% of max
             gpu_max_clock: 2000,
@@ -1000,6 +1049,7 @@ mod tests {
             cpu_clock: 3000,  // 66% of max - well below 92% threshold
             cpu_max_clock: 4500,
             cpu_load: 95.0,
+            cpu_power: 0.0,
             gpu_temp: 70_00,
             gpu_clock: 1900,  // 95% - above threshold
             gpu_max_clock: 2000,
@@ -1020,6 +1070,7 @@ mod tests {
             cpu_clock: 2800,  // ~62% of max - well below 92% threshold
             cpu_max_clock: 4500,
             cpu_load: 98.0,
+            cpu_power: 0.0,
             gpu_temp: 80_00,
             gpu_clock: 1800,  // 90% - also below 92% threshold
             gpu_max_clock: 2000,
@@ -1041,6 +1092,7 @@ mod tests {
             cpu_clock: 2800,  // 62% of max - below 92% threshold
             cpu_max_clock: 4500,
             cpu_load: 98.0,
+            cpu_power: 0.0,
             gpu_temp: 80_00,
             gpu_clock: 1800,  // 90% - below 92% threshold
             gpu_max_clock: 2000,
@@ -1055,6 +1107,7 @@ mod tests {
             cpu_clock: 4400,  // 97.8% of max
             cpu_max_clock: 4500,
             cpu_load: 30.0,
+            cpu_power: 0.0,
             gpu_temp: 60_00,
             gpu_clock: 1900,  // 95% of max
             gpu_max_clock: 2000,
@@ -1077,6 +1130,7 @@ mod tests {
             cpu_clock: 0,
             cpu_max_clock: 0,
             cpu_load: 95.0,
+            cpu_power: 0.0,
             gpu_temp: 80_00,
             gpu_clock: 0,
             gpu_max_clock: 0,
@@ -1096,6 +1150,7 @@ mod tests {
             cpu_clock: 4400,  // 97.8% - above 92% threshold
             cpu_max_clock: 4500,
             cpu_load: 30.0,
+            cpu_power: 0.0,
             gpu_temp: 85_00,
             gpu_clock: 1400,  // 70% of max - well below 92% threshold
             gpu_max_clock: 2000,

@@ -116,9 +116,9 @@ impl DaemonCallback for ConsoleCallback {
         if self.first {
             println!("Starting fan control loop (Ctrl+C to stop)");
             println!("PBO-based curve | Ramp-down: 10s delay\n");
-            println!("{:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8} {:>20}",
-                "Instant", "Avg", "Target", "Actual", "CPU%", "GPU%", "Sustain", "State");
-            println!("{}", "-".repeat(90));
+            println!("{:>8} {:>8} {:>8} {:>8} {:>7} {:>6} {:>6} {:>8} {:>20}",
+                "Instant", "Avg", "Target", "Actual", "CPU%", "PkgW", "GpuC", "Sustain", "State");
+            println!("{}", "-".repeat(100));
             self.first = false;
         }
 
@@ -133,14 +133,15 @@ impl DaemonCallback for ConsoleCallback {
             "     -".to_string()
         };
 
-        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {:>6.1}% {:>6.1}% {:>8} {:>20}",
+        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {:>6.1}% {:>5.0}W {:>5.0}C {:>8} {:>20}",
             output.instant_temp as f32 / 100.0,
             output.smoothed_temp as f32 / 100.0,
             output.target_duty as f32 / 100.0,
             output.actual_duty as f32 / 100.0,
             change_marker,
             output.cpu_load,
-            output.gpu_load,
+            output.cpu_power,
+            output.gpu_temp as f32 / 100.0,
             sustained_str,
             output.reason,
         );
