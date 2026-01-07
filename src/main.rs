@@ -45,14 +45,17 @@ impl daemon::DaemonCallback for LogCallback {
         // Log fan duty changes
         if output.duty_changed {
             debug!(
-                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({}) [clock: {}/{}MHz, load: {:.1}%]",
+                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({}) [CPU: {}/{}MHz {:.1}%, GPU: {}/{}MHz {:.1}%]",
                 output.instant_temp as f32 / 100.0,
                 output.smoothed_temp as f32 / 100.0,
                 output.actual_duty as f32 / 100.0,
                 output.reason,
                 output.cpu_clock,
-                output.max_clock,
+                output.cpu_max_clock,
                 output.cpu_load,
+                output.gpu_clock,
+                output.gpu_max_clock,
+                output.gpu_load,
             );
         }
 
@@ -61,27 +64,37 @@ impl daemon::DaemonCallback for LogCallback {
             match output.throttle_status {
                 ThrottleStatus::None => {
                     if self.last_throttle_status.is_throttling() {
-                        info!("Thermal throttling cleared - CPU clocks restored");
+                        info!("Thermal throttling cleared - clocks restored");
                     }
                 }
                 ThrottleStatus::Likely => {
+                    let cpu_pct = if output.cpu_max_clock > 0 {
+                        (output.cpu_clock as f32 / output.cpu_max_clock as f32) * 100.0
+                    } else { 100.0 };
+                    let gpu_pct = if output.gpu_max_clock > 0 {
+                        (output.gpu_clock as f32 / output.gpu_max_clock as f32) * 100.0
+                    } else { 100.0 };
                     warn!(
-                        "Possible thermal throttling detected: {:.1}C, clock {}/{}MHz ({:.0}%), load {:.1}%",
+                        "Possible thermal throttling: {:.1}C, CPU {}/{}MHz ({:.0}%) load {:.1}%, GPU {}/{}MHz ({:.0}%) load {:.1}% - boosting curve +{}C",
                         output.instant_temp as f32 / 100.0,
-                        output.cpu_clock,
-                        output.max_clock,
-                        (output.cpu_clock as f32 / output.max_clock as f32) * 100.0,
-                        output.cpu_load,
+                        output.cpu_clock, output.cpu_max_clock, cpu_pct, output.cpu_load,
+                        output.gpu_clock, output.gpu_max_clock, gpu_pct, output.gpu_load,
+                        output.throttle_boost / 100,
                     );
                 }
                 ThrottleStatus::Confirmed => {
+                    let cpu_pct = if output.cpu_max_clock > 0 {
+                        (output.cpu_clock as f32 / output.cpu_max_clock as f32) * 100.0
+                    } else { 100.0 };
+                    let gpu_pct = if output.gpu_max_clock > 0 {
+                        (output.gpu_clock as f32 / output.gpu_max_clock as f32) * 100.0
+                    } else { 100.0 };
                     warn!(
-                        "THERMAL THROTTLING CONFIRMED: {:.1}C, clock {}/{}MHz ({:.0}%), load {:.1}%",
+                        "THROTTLING CONFIRMED: {:.1}C, CPU {}/{}MHz ({:.0}%) load {:.1}%, GPU {}/{}MHz ({:.0}%) load {:.1}% - boosting curve +{}C",
                         output.instant_temp as f32 / 100.0,
-                        output.cpu_clock,
-                        output.max_clock,
-                        (output.cpu_clock as f32 / output.max_clock as f32) * 100.0,
-                        output.cpu_load,
+                        output.cpu_clock, output.cpu_max_clock, cpu_pct, output.cpu_load,
+                        output.gpu_clock, output.gpu_max_clock, gpu_pct, output.gpu_load,
+                        output.throttle_boost / 100,
                     );
                 }
             }
@@ -138,7 +151,7 @@ fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
     // Create fan controller with smoothing and hysteresis
     let mut controller = FanController::new(curve)
         .with_smoothing_window(5)
-        .with_ramp_up_delay(3.0)
+        .with_ramp_up_delay(1.5)  // Faster response (was 3.0)
         .with_ramp_down_delay(10.0)
         .with_min_duty_change(2_00);
 

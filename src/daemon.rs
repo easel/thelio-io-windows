@@ -116,36 +116,45 @@ impl DaemonCallback for ConsoleCallback {
         if self.first {
             println!("Starting fan control loop (Ctrl+C to stop)");
             println!("Smoothing: 5s window | Ramp-up: 3s delay | Ramp-down: 10s delay\n");
-            println!("{:>8} {:>8} {:>8} {:>8} {:>8} {:>6} {:>18}",
-                "Instant", "Avg", "Target", "Actual", "Clock", "Load", "State");
-            println!("{}", "-".repeat(82));
+            println!("{:>8} {:>8} {:>8} {:>8} {:>10} {:>6} {:>10} {:>6} {:>14}",
+                "Instant", "Avg", "Target", "Actual", "CPU Clk", "CPU%", "GPU Clk", "GPU%", "State");
+            println!("{}", "-".repeat(100));
             self.first = false;
         }
 
         let change_marker = if output.duty_changed { "*" } else { " " };
 
-        // Format throttle indicator
+        // Format throttle indicator with boost info
         let throttle_indicator = match output.throttle_status {
-            ThrottleStatus::None => "",
-            ThrottleStatus::Likely => " [THROTTLE?]",
-            ThrottleStatus::Confirmed => " [THROTTLING]",
+            ThrottleStatus::None => String::new(),
+            ThrottleStatus::Likely => format!(" [THROTTLE? +{}C]", output.throttle_boost / 100),
+            ThrottleStatus::Confirmed => format!(" [THROTTLING +{}C]", output.throttle_boost / 100),
         };
 
-        // Format clock as "current/max MHz" or empty if no data
-        let clock_str = if output.max_clock > 0 {
-            format!("{:>4}/{:<4}", output.cpu_clock, output.max_clock)
+        // Format CPU clock as "current/max MHz" or empty if no data
+        let cpu_clock_str = if output.cpu_max_clock > 0 {
+            format!("{:>4}/{:<4}", output.cpu_clock, output.cpu_max_clock)
         } else {
             "   -    ".to_string()
         };
 
-        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {} {:>5.1}% {:>16}{}",
+        // Format GPU clock as "current/max MHz" or empty if no data
+        let gpu_clock_str = if output.gpu_max_clock > 0 {
+            format!("{:>4}/{:<4}", output.gpu_clock, output.gpu_max_clock)
+        } else {
+            "   -    ".to_string()
+        };
+
+        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {} {:>5.1}% {} {:>5.1}% {:>12}{}",
             output.instant_temp as f32 / 100.0,
             output.smoothed_temp as f32 / 100.0,
             output.target_duty as f32 / 100.0,
             output.actual_duty as f32 / 100.0,
             change_marker,
-            clock_str,
+            cpu_clock_str,
             output.cpu_load,
+            gpu_clock_str,
+            output.gpu_load,
             output.reason,
             throttle_indicator,
         );

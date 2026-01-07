@@ -25,14 +25,24 @@ impl ThrottleStatus {
 /// Sensor data from the hardware monitor wrapper
 #[derive(Clone, Debug, Default)]
 pub struct SensorData {
-    /// Temperature (hundredths of a degree, 8500 = 85.00C)
+    /// Combined temperature - max of CPU and GPU (hundredths of a degree)
     pub temp: i16,
+    /// CPU temperature (hundredths of a degree)
+    pub cpu_temp: i16,
     /// Current average CPU clock in MHz
     pub cpu_clock: u32,
     /// Maximum observed CPU clock in MHz (approximates max boost)
-    pub max_clock: u32,
+    pub cpu_max_clock: u32,
     /// CPU load percentage (0-100)
     pub cpu_load: f32,
+    /// GPU temperature (hundredths of a degree)
+    pub gpu_temp: i16,
+    /// Current GPU core clock in MHz
+    pub gpu_clock: u32,
+    /// Maximum observed GPU clock in MHz
+    pub gpu_max_clock: u32,
+    /// GPU load percentage (0-100)
+    pub gpu_load: f32,
 }
 
 impl SensorData {
@@ -42,15 +52,25 @@ impl SensorData {
         let json = json.trim();
 
         let temp = Self::extract_float(json, "temp")?;
+        let cpu_temp = Self::extract_float(json, "cpu_temp")?;
         let cpu_clock = Self::extract_int(json, "cpu_clock")?;
-        let max_clock = Self::extract_int(json, "max_clock")?;
+        let cpu_max_clock = Self::extract_int(json, "cpu_max_clock")?;
         let cpu_load = Self::extract_float(json, "cpu_load")?;
+        let gpu_temp = Self::extract_float(json, "gpu_temp")?;
+        let gpu_clock = Self::extract_int(json, "gpu_clock")?;
+        let gpu_max_clock = Self::extract_int(json, "gpu_max_clock")?;
+        let gpu_load = Self::extract_float(json, "gpu_load")?;
 
         Ok(Self {
             temp: (temp * 100.0) as i16,
+            cpu_temp: (cpu_temp * 100.0) as i16,
             cpu_clock: cpu_clock as u32,
-            max_clock: max_clock as u32,
+            cpu_max_clock: cpu_max_clock as u32,
             cpu_load: cpu_load as f32,
+            gpu_temp: (gpu_temp * 100.0) as i16,
+            gpu_clock: gpu_clock as u32,
+            gpu_max_clock: gpu_max_clock as u32,
+            gpu_load: gpu_load as f32,
         })
     }
 
@@ -83,10 +103,12 @@ impl SensorData {
     }
 }
 
-/// Throttle detector with history tracking
+/// Throttle detector with history tracking for CPU and GPU
 pub struct ThrottleDetector {
-    /// Number of consecutive samples showing throttle-like behavior
-    throttle_count: u32,
+    /// Number of consecutive samples showing CPU throttle-like behavior
+    cpu_throttle_count: u32,
+    /// Number of consecutive samples showing GPU throttle-like behavior
+    gpu_throttle_count: u32,
     /// Threshold: clock must be this % below max to indicate throttling
     clock_threshold_pct: f32,
     /// Threshold: load must be above this % to consider throttling
@@ -98,42 +120,86 @@ pub struct ThrottleDetector {
 impl ThrottleDetector {
     pub fn new() -> Self {
         Self {
-            throttle_count: 0,
-            clock_threshold_pct: 85.0, // Clock below 85% of max = suspicious
+            cpu_throttle_count: 0,
+            gpu_throttle_count: 0,
+            clock_threshold_pct: 92.0, // Clock below 92% of max = suspicious (was 85%)
             load_threshold_pct: 70.0,  // Only check when load > 70%
-            confirm_samples: 3,        // 3 consecutive samples = confirmed
+            confirm_samples: 1,        // React immediately (was 3)
         }
     }
 
-    /// Analyze sensor data and return throttle status
+    /// Check if a component is throttling based on clock and load
+    fn check_throttle(&self, clock: u32, max_clock: u32, load: f32) -> bool {
+        if max_clock == 0 {
+            return false;
+        }
+        let clock_pct = (clock as f32 / max_clock as f32) * 100.0;
+        let is_under_load = load >= self.load_threshold_pct;
+        let clock_reduced = clock_pct < self.clock_threshold_pct;
+        is_under_load && clock_reduced
+    }
+
+    /// Analyze sensor data and return throttle status (checks both CPU and GPU)
     pub fn analyze(&mut self, data: &SensorData) -> ThrottleStatus {
-        // Can't detect throttling without clock data
-        if data.max_clock == 0 {
-            return ThrottleStatus::None;
+        // Check CPU throttling
+        let cpu_throttling = self.check_throttle(
+            data.cpu_clock, data.cpu_max_clock, data.cpu_load
+        );
+
+        // Check GPU throttling
+        let gpu_throttling = self.check_throttle(
+            data.gpu_clock, data.gpu_max_clock, data.gpu_load
+        );
+
+        // Update counters
+        if cpu_throttling {
+            self.cpu_throttle_count += 1;
+        } else {
+            self.cpu_throttle_count = 0;
         }
 
-        let clock_pct = (data.cpu_clock as f32 / data.max_clock as f32) * 100.0;
-        let is_under_load = data.cpu_load >= self.load_threshold_pct;
-        let clock_reduced = clock_pct < self.clock_threshold_pct;
-
-        if is_under_load && clock_reduced {
-            self.throttle_count += 1;
-
-            if self.throttle_count >= self.confirm_samples {
-                ThrottleStatus::Confirmed
-            } else {
-                ThrottleStatus::Likely
-            }
+        if gpu_throttling {
+            self.gpu_throttle_count += 1;
         } else {
-            // Reset counter when conditions clear
-            self.throttle_count = 0;
+            self.gpu_throttle_count = 0;
+        }
+
+        // Return worst status between CPU and GPU
+        let cpu_status = self.count_to_status(self.cpu_throttle_count);
+        let gpu_status = self.count_to_status(self.gpu_throttle_count);
+
+        // Return the more severe status
+        match (cpu_status, gpu_status) {
+            (ThrottleStatus::Confirmed, _) | (_, ThrottleStatus::Confirmed) => ThrottleStatus::Confirmed,
+            (ThrottleStatus::Likely, _) | (_, ThrottleStatus::Likely) => ThrottleStatus::Likely,
+            _ => ThrottleStatus::None,
+        }
+    }
+
+    fn count_to_status(&self, count: u32) -> ThrottleStatus {
+        if count >= self.confirm_samples {
+            ThrottleStatus::Confirmed
+        } else if count > 0 {
+            ThrottleStatus::Likely
+        } else {
             ThrottleStatus::None
         }
     }
 
     /// Reset the detector state
     pub fn reset(&mut self) {
-        self.throttle_count = 0;
+        self.cpu_throttle_count = 0;
+        self.gpu_throttle_count = 0;
+    }
+
+    /// Check if CPU is currently throttling
+    pub fn is_cpu_throttling(&self) -> bool {
+        self.cpu_throttle_count > 0
+    }
+
+    /// Check if GPU is currently throttling
+    pub fn is_gpu_throttling(&self) -> bool {
+        self.gpu_throttle_count > 0
     }
 }
 
@@ -195,19 +261,18 @@ impl FanCurve {
         self
     }
 
-    /// The standard fan curve - gradual with wide temperature bands to minimize bouncing
+    /// The standard fan curve - more aggressive at high temps to prevent thermal throttling
     pub fn standard() -> Self {
         Self::default()
             .append(59_99, 0_00)    // Fans off until 60°C
             .append(60_00, 25_00)   // 25% at 60°C
             .append(65_00, 30_00)   // 30% at 65°C
-            .append(70_00, 35_00)   // 35% at 70°C
-            .append(75_00, 45_00)   // 45% at 75°C
-            .append(80_00, 55_00)   // 55% at 80°C
-            .append(83_00, 63_00)   // 63% at 83°C
-            .append(85_00, 70_00)   // 70% at 85°C
-            .append(88_00, 85_00)   // 85% at 88°C
-            .append(90_00, 100_00)  // 100% at 90°C
+            .append(70_00, 40_00)   // 40% at 70°C (was 35%)
+            .append(75_00, 55_00)   // 55% at 75°C (was 45%)
+            .append(80_00, 70_00)   // 70% at 80°C (was 55%)
+            .append(83_00, 80_00)   // 80% at 83°C (was 63%)
+            .append(85_00, 90_00)   // 90% at 85°C (was 70%) - critical temp threshold
+            .append(87_00, 100_00)  // 100% at 87°C (was 90°C)
     }
 
     /// Fan curve for threadripper 2
@@ -323,6 +388,10 @@ pub struct FanController {
     min_duty_change: u16,
     /// Throttle detector for monitoring thermal throttling
     throttle_detector: ThrottleDetector,
+    /// Temperature boost when throttling is "likely" (hundredths of a degree)
+    throttle_boost_likely: i16,
+    /// Temperature boost when throttling is "confirmed" (hundredths of a degree)
+    throttle_boost_confirmed: i16,
 }
 
 impl FanController {
@@ -333,6 +402,7 @@ impl FanController {
     /// - 3 second ramp-up delay
     /// - 10 second ramp-down delay
     /// - 200 (2%) minimum duty change
+    /// - 5°C boost when throttling likely, 10°C when confirmed
     pub fn new(curve: FanCurve) -> Self {
         Self {
             curve,
@@ -345,6 +415,8 @@ impl FanController {
             ramp_down_delay_secs: 10.0,
             min_duty_change: 2_00, // 2%
             throttle_detector: ThrottleDetector::new(),
+            throttle_boost_likely: 5_00,    // +5°C
+            throttle_boost_confirmed: 10_00, // +10°C
         }
     }
 
@@ -387,12 +459,21 @@ impl FanController {
     pub fn update(&mut self, temp: i16) -> FanControllerOutput {
         let data = SensorData {
             temp,
+            cpu_temp: temp,
             cpu_clock: 0,
-            max_clock: 0,
+            cpu_max_clock: 0,
             cpu_load: 0.0,
+            gpu_temp: 0,
+            gpu_clock: 0,
+            gpu_max_clock: 0,
+            gpu_load: 0.0,
         };
         self.update_with_sensors(&data)
     }
+
+    /// Critical temperature threshold (hundredths of a degree) - 85°C
+    /// Above this, immediately jump to 100% fans bypassing all delays
+    const CRITICAL_TEMP: i16 = 85_00;
 
     /// Update the controller with full sensor data including throttle detection.
     /// Returns the duty cycle to set (if it should change) and debug info.
@@ -400,8 +481,48 @@ impl FanController {
         let now = Instant::now();
         let temp = data.temp;
 
+        // CRITICAL TEMPERATURE OVERRIDE - bypass all delays for safety
+        if temp >= Self::CRITICAL_TEMP {
+            self.temp_history.push_back(temp);
+            while self.temp_history.len() > self.smoothing_window {
+                self.temp_history.pop_front();
+            }
+
+            // Force 100% immediately
+            let was_duty = self.current_duty;
+            self.current_duty = 100_00;
+            self.last_increase = Some(now);
+            self.last_decrease = None;
+
+            return FanControllerOutput {
+                instant_temp: temp,
+                smoothed_temp: self.smoothed_temp(),
+                target_duty: 100_00,
+                actual_duty: 100_00,
+                duty_changed: was_duty != 100_00,
+                reason: "CRITICAL TEMP",
+                throttle_status: ThrottleStatus::Confirmed, // Assume throttling at critical temps
+                throttle_boost: 0,
+                cpu_temp: data.cpu_temp,
+                cpu_clock: data.cpu_clock,
+                cpu_max_clock: data.cpu_max_clock,
+                cpu_load: data.cpu_load,
+                gpu_temp: data.gpu_temp,
+                gpu_clock: data.gpu_clock,
+                gpu_max_clock: data.gpu_max_clock,
+                gpu_load: data.gpu_load,
+            };
+        }
+
         // Analyze throttle status
         let throttle_status = self.throttle_detector.analyze(data);
+
+        // Apply temperature boost if throttling detected
+        let throttle_boost = match throttle_status {
+            ThrottleStatus::None => 0,
+            ThrottleStatus::Likely => self.throttle_boost_likely,
+            ThrottleStatus::Confirmed => self.throttle_boost_confirmed,
+        };
 
         // Add to history, maintain window size
         self.temp_history.push_back(temp);
@@ -410,7 +531,9 @@ impl FanController {
         }
 
         let smoothed_temp = self.smoothed_temp();
-        let target_duty = self.curve.get_duty(smoothed_temp).unwrap_or(0);
+        // Apply boost to the temperature used for curve lookup
+        let boosted_temp = smoothed_temp.saturating_add(throttle_boost);
+        let target_duty = self.curve.get_duty(boosted_temp).unwrap_or(0);
 
         let mut output = FanControllerOutput {
             instant_temp: temp,
@@ -420,9 +543,15 @@ impl FanController {
             duty_changed: false,
             reason: "holding",
             throttle_status,
+            throttle_boost,
+            cpu_temp: data.cpu_temp,
             cpu_clock: data.cpu_clock,
-            max_clock: data.max_clock,
+            cpu_max_clock: data.cpu_max_clock,
             cpu_load: data.cpu_load,
+            gpu_temp: data.gpu_temp,
+            gpu_clock: data.gpu_clock,
+            gpu_max_clock: data.gpu_max_clock,
+            gpu_load: data.gpu_load,
         };
 
         // Calculate duty difference
@@ -518,14 +647,26 @@ pub struct FanControllerOutput {
     pub duty_changed: bool,
     /// Why we made this decision
     pub reason: &'static str,
-    /// Thermal throttle status
+    /// Thermal throttle status (worst of CPU/GPU)
     pub throttle_status: ThrottleStatus,
+    /// Temperature boost applied due to throttling (hundredths of a degree)
+    pub throttle_boost: i16,
+    /// CPU temperature (hundredths of a degree)
+    pub cpu_temp: i16,
     /// Current CPU clock in MHz
     pub cpu_clock: u32,
     /// Max observed CPU clock in MHz
-    pub max_clock: u32,
+    pub cpu_max_clock: u32,
     /// CPU load percentage
     pub cpu_load: f32,
+    /// GPU temperature (hundredths of a degree)
+    pub gpu_temp: i16,
+    /// Current GPU clock in MHz
+    pub gpu_clock: u32,
+    /// Max observed GPU clock in MHz
+    pub gpu_max_clock: u32,
+    /// GPU load percentage
+    pub gpu_load: f32,
 }
 
 #[cfg(test)]
@@ -542,15 +683,15 @@ mod tests {
         assert_eq!(curve.get_duty(40_00), Some(0));
 
         // At exact points
-        assert_eq!(curve.get_duty(45_00), Some(30_00));
-        assert_eq!(curve.get_duty(88_00), Some(100_00));
+        assert_eq!(curve.get_duty(65_00), Some(30_00));
+        assert_eq!(curve.get_duty(87_00), Some(100_00));  // Now 100% at 87°C
 
         // Above last point
         assert_eq!(curve.get_duty(95_00), Some(100_00));
 
-        // Interpolated value between 45C (30%) and 55C (35%)
-        let duty_at_50 = curve.get_duty(50_00).unwrap();
-        assert!(duty_at_50 > 30_00 && duty_at_50 < 35_00);
+        // Interpolated value between 65C (30%) and 70C (40%)
+        let duty_at_67 = curve.get_duty(67_00).unwrap();
+        assert!(duty_at_67 > 30_00 && duty_at_67 < 40_00);
     }
 
     #[test]
@@ -608,13 +749,14 @@ mod tests {
             .with_ramp_down_delay(10.0)
             .with_min_duty_change(0);  // React to any change
 
-        // Start at moderate temp (50C = 32.5% duty)
-        controller.update(50_00);
+        // Start at moderate temp (65C = 30% duty in new curve)
+        controller.update(65_00);
         sleep(Duration::from_millis(10));
-        controller.update(50_00);
+        controller.update(65_00);
 
-        // Small increase (55C = 35% duty) - only 2.5% change, should delay
-        let output = controller.update(55_00);
+        // Small increase (68C = ~36% duty) - only 6% change, should delay
+        // (10%+ change triggers immediate ramp-up for safety)
+        let output = controller.update(68_00);
         assert_eq!(output.reason, "ramp-up delayed");
         assert!(!output.duty_changed);
 
@@ -622,7 +764,7 @@ mod tests {
         sleep(Duration::from_millis(150));
 
         // Now it should ramp up
-        let output = controller.update(55_00);
+        let output = controller.update(68_00);
         assert!(output.duty_changed);
         assert_eq!(output.reason, "ramp-up");
     }
@@ -636,17 +778,18 @@ mod tests {
             .with_ramp_down_delay(0.1)  // 100ms delay
             .with_min_duty_change(0);
 
-        // Start hot, let it ramp up
-        controller.update(88_00);  // 100% duty
+        // Start hot (but below critical 85°C to avoid override), let it ramp up
+        controller.update(84_00);  // ~88% duty at 84°C
         sleep(Duration::from_millis(10));
-        let output = controller.update(88_00);
-        assert_eq!(output.actual_duty, 100_00);
+        let output = controller.update(84_00);
+        let hot_duty = output.actual_duty;
+        assert!(hot_duty > 80_00);  // Should be high duty
 
         // Go cold - should delay ramp down
         let output = controller.update(40_00);
         assert!(!output.duty_changed);
         assert_eq!(output.reason, "ramp-down delayed");
-        assert_eq!(output.actual_duty, 100_00);  // Still at 100%
+        assert_eq!(output.actual_duty, hot_duty);  // Still at hot duty
 
         // Wait for delay
         sleep(Duration::from_millis(150));
@@ -669,10 +812,34 @@ mod tests {
         controller.update(40_00);
 
         // Large jump (>10% duty change) should be immediate for safety
-        let output = controller.update(88_00);  // Would be 100% duty
+        // Use 82°C which is ~75% duty - a big jump from 0%
+        let output = controller.update(82_00);
 
         // Should change immediately despite delay
         assert!(output.duty_changed);
+    }
+
+    #[test]
+    fn test_controller_critical_temp_override() {
+        let curve = FanCurve::standard();
+        let mut controller = FanController::new(curve)
+            .with_smoothing_window(5)  // Long smoothing
+            .with_ramp_up_delay(10.0)  // Long delay
+            .with_min_duty_change(10_00);  // High threshold
+
+        // Start cold
+        controller.update(40_00);
+
+        // Critical temp (85°C+) should immediately jump to 100%, bypassing all delays
+        let output = controller.update(85_00);
+        assert!(output.duty_changed);
+        assert_eq!(output.actual_duty, 100_00);
+        assert_eq!(output.reason, "CRITICAL TEMP");
+
+        // Even higher critical temp
+        let output = controller.update(95_00);
+        assert_eq!(output.actual_duty, 100_00);
+        assert_eq!(output.reason, "CRITICAL TEMP");
     }
 
     #[test]
@@ -720,64 +887,89 @@ mod tests {
 
     #[test]
     fn test_sensor_data_from_json() {
-        let json = r#"{"temp":85.50,"cpu_clock":3200,"max_clock":4500,"cpu_load":95.25}"#;
+        let json = r#"{"temp":85.50,"cpu_temp":82.00,"cpu_clock":3200,"cpu_max_clock":4500,"cpu_load":95.25,"gpu_temp":75.00,"gpu_clock":1800,"gpu_max_clock":2000,"gpu_load":80.00}"#;
         let data = SensorData::from_json(json).unwrap();
 
         assert_eq!(data.temp, 85_50); // 85.50C in hundredths
+        assert_eq!(data.cpu_temp, 82_00);
         assert_eq!(data.cpu_clock, 3200);
-        assert_eq!(data.max_clock, 4500);
+        assert_eq!(data.cpu_max_clock, 4500);
         assert!((data.cpu_load - 95.25).abs() < 0.01);
+        assert_eq!(data.gpu_temp, 75_00);
+        assert_eq!(data.gpu_clock, 1800);
+        assert_eq!(data.gpu_max_clock, 2000);
+        assert!((data.gpu_load - 80.0).abs() < 0.01);
     }
 
     #[test]
     fn test_sensor_data_from_json_integer_values() {
         // Test with integer values (no decimal points)
-        let json = r#"{"temp":90,"cpu_clock":4000,"max_clock":4500,"cpu_load":50}"#;
+        let json = r#"{"temp":90,"cpu_temp":88,"cpu_clock":4000,"cpu_max_clock":4500,"cpu_load":50,"gpu_temp":70,"gpu_clock":1500,"gpu_max_clock":2000,"gpu_load":30}"#;
         let data = SensorData::from_json(json).unwrap();
 
         assert_eq!(data.temp, 90_00);
+        assert_eq!(data.cpu_temp, 88_00);
         assert_eq!(data.cpu_clock, 4000);
-        assert_eq!(data.max_clock, 4500);
+        assert_eq!(data.cpu_max_clock, 4500);
         assert!((data.cpu_load - 50.0).abs() < 0.01);
+        assert_eq!(data.gpu_temp, 70_00);
+        assert_eq!(data.gpu_clock, 1500);
+        assert_eq!(data.gpu_max_clock, 2000);
+        assert!((data.gpu_load - 30.0).abs() < 0.01);
     }
 
     #[test]
     fn test_throttle_detector_no_throttling() {
         let mut detector = ThrottleDetector::new();
 
-        // Normal operation: high clock, any load
+        // Normal operation: high clock (>92%), any load
         let data = SensorData {
             temp: 70_00,
-            cpu_clock: 4300,
-            max_clock: 4500,
+            cpu_temp: 70_00,
+            cpu_clock: 4300,  // 95.5% of max - above 92% threshold
+            cpu_max_clock: 4500,
             cpu_load: 50.0,
+            gpu_temp: 60_00,
+            gpu_clock: 1900,  // 95% of max
+            gpu_max_clock: 2000,
+            gpu_load: 30.0,
         };
         assert_eq!(detector.analyze(&data), ThrottleStatus::None);
 
-        // High load but clock still high
+        // High load but clock still high (>92%)
         let data = SensorData {
             temp: 85_00,
-            cpu_clock: 4200,
-            max_clock: 4500,
+            cpu_temp: 85_00,
+            cpu_clock: 4200,  // 93.3% of max - above 92% threshold
+            cpu_max_clock: 4500,
             cpu_load: 95.0,
+            gpu_temp: 75_00,
+            gpu_clock: 1900,  // 95% of max
+            gpu_max_clock: 2000,
+            gpu_load: 85.0,
         };
         assert_eq!(detector.analyze(&data), ThrottleStatus::None);
     }
 
     #[test]
-    fn test_throttle_detector_likely_throttling() {
+    fn test_throttle_detector_immediate_detection() {
         let mut detector = ThrottleDetector::new();
 
-        // High load with reduced clock
+        // High load with reduced CPU clock (GPU normal)
         let data = SensorData {
             temp: 90_00,
-            cpu_clock: 3000,  // 66% of max
-            max_clock: 4500,
+            cpu_temp: 90_00,
+            cpu_clock: 3000,  // 66% of max - well below 92% threshold
+            cpu_max_clock: 4500,
             cpu_load: 95.0,
+            gpu_temp: 70_00,
+            gpu_clock: 1900,  // 95% - above threshold
+            gpu_max_clock: 2000,
+            gpu_load: 50.0,
         };
 
-        // First sample - likely
-        assert_eq!(detector.analyze(&data), ThrottleStatus::Likely);
+        // With confirm_samples=1, throttling is immediately confirmed
+        assert_eq!(detector.analyze(&data), ThrottleStatus::Confirmed);
     }
 
     #[test]
@@ -786,14 +978,17 @@ mod tests {
 
         let data = SensorData {
             temp: 95_00,
-            cpu_clock: 2800,  // ~62% of max
-            max_clock: 4500,
+            cpu_temp: 95_00,
+            cpu_clock: 2800,  // ~62% of max - well below 92% threshold
+            cpu_max_clock: 4500,
             cpu_load: 98.0,
+            gpu_temp: 80_00,
+            gpu_clock: 1800,  // 90% - also below 92% threshold
+            gpu_max_clock: 2000,
+            gpu_load: 75.0,   // Above 70% load threshold
         };
 
-        // Need 3 consecutive samples to confirm
-        assert_eq!(detector.analyze(&data), ThrottleStatus::Likely);
-        assert_eq!(detector.analyze(&data), ThrottleStatus::Likely);
+        // With confirm_samples=1, first sample immediately confirms throttling
         assert_eq!(detector.analyze(&data), ThrottleStatus::Confirmed);
     }
 
@@ -804,24 +999,33 @@ mod tests {
         // Build up throttle state
         let throttle_data = SensorData {
             temp: 95_00,
-            cpu_clock: 2800,
-            max_clock: 4500,
+            cpu_temp: 95_00,
+            cpu_clock: 2800,  // 62% of max - below 92% threshold
+            cpu_max_clock: 4500,
             cpu_load: 98.0,
+            gpu_temp: 80_00,
+            gpu_clock: 1800,  // 90% - below 92% threshold
+            gpu_max_clock: 2000,
+            gpu_load: 75.0,   // Above 70% load threshold
         };
-        detector.analyze(&throttle_data);
-        detector.analyze(&throttle_data);
+        assert_eq!(detector.analyze(&throttle_data), ThrottleStatus::Confirmed);
 
-        // Now recover - clock returns to normal
+        // Now recover - clock returns to normal (>92%)
         let normal_data = SensorData {
             temp: 70_00,
-            cpu_clock: 4400,
-            max_clock: 4500,
+            cpu_temp: 70_00,
+            cpu_clock: 4400,  // 97.8% of max
+            cpu_max_clock: 4500,
             cpu_load: 30.0,
+            gpu_temp: 60_00,
+            gpu_clock: 1900,  // 95% of max
+            gpu_max_clock: 2000,
+            gpu_load: 20.0,
         };
         assert_eq!(detector.analyze(&normal_data), ThrottleStatus::None);
 
-        // Counter should be reset, so next throttle starts fresh
-        assert_eq!(detector.analyze(&throttle_data), ThrottleStatus::Likely);
+        // Counter should be reset, so next throttle immediately confirms
+        assert_eq!(detector.analyze(&throttle_data), ThrottleStatus::Confirmed);
     }
 
     #[test]
@@ -831,10 +1035,38 @@ mod tests {
         // No clock data available
         let data = SensorData {
             temp: 90_00,
+            cpu_temp: 90_00,
             cpu_clock: 0,
-            max_clock: 0,
+            cpu_max_clock: 0,
             cpu_load: 95.0,
+            gpu_temp: 80_00,
+            gpu_clock: 0,
+            gpu_max_clock: 0,
+            gpu_load: 80.0,
         };
         assert_eq!(detector.analyze(&data), ThrottleStatus::None);
+    }
+
+    #[test]
+    fn test_throttle_detector_gpu_throttling() {
+        let mut detector = ThrottleDetector::new();
+
+        // CPU fine but GPU throttling
+        let data = SensorData {
+            temp: 85_00,
+            cpu_temp: 70_00,
+            cpu_clock: 4400,  // 97.8% - above 92% threshold
+            cpu_max_clock: 4500,
+            cpu_load: 30.0,
+            gpu_temp: 85_00,
+            gpu_clock: 1400,  // 70% of max - well below 92% threshold
+            gpu_max_clock: 2000,
+            gpu_load: 95.0,   // Above 70% load threshold
+        };
+
+        // GPU throttling immediately confirmed
+        assert_eq!(detector.analyze(&data), ThrottleStatus::Confirmed);
+        assert!(detector.is_gpu_throttling());
+        assert!(!detector.is_cpu_throttling());
     }
 }
