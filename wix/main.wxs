@@ -1,4 +1,3 @@
-<?xml version='1.0' encoding='windows-1252'?>
 <!--
   Copyright (C) 2017 Christopher R. Field.
 
@@ -15,191 +14,98 @@
   limitations under the License.
 -->
 
-<!--
-  Please do not remove these pre-processor If-Else blocks. These are used with
-  the `cargo wix` subcommand to automatically determine the installation
-  destination for 32-bit versus 64-bit installers. Removal of these lines will
-  cause installation errors.
--->
-<?if $(var.Platform) = x64 ?>
-    <?define Win64 = "yes" ?>
-    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
-<?else ?>
-  <?define Win64 = "no" ?>
-  <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
-<?endif ?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
 
-<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'
-    xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
-    <Product
-        Id='*'
-        Name='System76 Thelio Io'
-        UpgradeCode='69D3AF2E-8CD5-4E0D-BA40-1FEA0A7C6546'
-        Manufacturer='System76'
-        Language='1033'
-        Codepage='1252'
-        Version='$(var.Version)'>
+    <Package Name="System76 Thelio Io"
+             UpgradeCode="69D3AF2E-8CD5-4E0D-BA40-1FEA0A7C6546"
+             Manufacturer="System76"
+             Language="1033"
+             Codepage="1252"
+             Version="$(var.Version)"
+             InstallerVersion="500">
 
-        <Package Id='*'
-            Keywords='Installer'
-            Description='System76 Thelio Io'
-            Manufacturer='System76'
-            InstallerVersion='450'
-            Languages='1033'
-            Compressed='yes'
-            InstallScope='perMachine'
-            SummaryCodepage='1252'
-            Platform='$(var.Platform)'/>
+        <SummaryInformation Keywords="Installer"
+                            Description="System76 Thelio Io Fan Controller"
+                            Manufacturer="System76" />
 
-        <MajorUpgrade
-            Schedule='afterInstallInitialize'
-            AllowSameVersionUpgrades='yes'
-            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+        <MajorUpgrade Schedule="afterInstallInitialize"
+                      AllowSameVersionUpgrades="yes"
+                      DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit." />
 
-        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
-        <Property Id='DiskPrompt' Value='System76 Thelio Io Installation'/>
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1" />
+        <Property Id="DiskPrompt" Value="System76 Thelio Io Installation" />
+        <Property Id="ARPHELPLINK" Value="https://github.com/system76/thelio-io-windows" />
 
-        <Directory Id='TARGETDIR' Name='SourceDir'>
-            <Merge Id="VCRedist" SourceFile="msvc\Microsoft_VC142_CRT_x64.msm" DiskId="1" Language="0"/>
+        <StandardDirectory Id="ProgramFiles64Folder">
+            <Directory Id="APPLICATIONFOLDER" Name="System76 Thelio Io">
+                <Component Id="License" Bitness="always64">
+                    <File Id="LicenseFile"
+                          Name="License.rtf"
+                          Source="wix\License.rtf"
+                          KeyPath="yes" />
+                </Component>
 
-            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
-                <Directory Id='APPLICATIONFOLDER' Name='System76 Thelio Io'>
-                    <!--
-                      Disabling the license sidecar file in the installer is a two step process:
-
-                      1. Comment out or remove the `Component` tag along with its contents.
-                      2. Comment out or remove the `ComponentRef` tag with the "License" Id
-                         attribute value further down in this file.
-                    -->
-                    <Component Id='License' Guid='*' Win64='$(var.Win64)'>
-                        <File Id='LicenseFile'
-                            Name='License.rtf'
-                            DiskId='1'
-                            Source='wix\License.rtf'
-                            KeyPath='yes'/>
+                <Directory Id="Bin" Name="bin">
+                    <Component Id="ServiceComponent" Bitness="always64">
+                        <File Id="ServiceExe"
+                              Name="thelio-io.exe"
+                              Source="target\$(var.Profile)\thelio-io.exe"
+                              KeyPath="yes" />
+                        <ServiceInstall Id="ServiceInstaller"
+                                        Name="thelio-io"
+                                        DisplayName="System76 Thelio Io"
+                                        Type="ownProcess"
+                                        Account="LocalSystem"
+                                        Start="auto"
+                                        ErrorControl="normal" />
+                        <ServiceControl Id="ServiceControl"
+                                        Name="thelio-io"
+                                        Start="install"
+                                        Stop="both"
+                                        Remove="uninstall"
+                                        Wait="yes" />
+                        <util:EventSource Log="Application"
+                                          Name="System76 Thelio Io"
+                                          EventMessageFile="[#ServiceExe]" />
                     </Component>
 
-                    <Directory Id='Bin' Name='bin'>
-                        <Component Id='binary0' Guid='*' Win64='$(var.Win64)'>
-                            <File
-                                Id='exe0'
-                                Name='thelio-io.exe'
-                                DiskId='1'
-                                Source='target\$(var.Profile)\thelio-io.exe'
-                                KeyPath='yes'/>
-                            <ServiceInstall
-                                Id="ServiceInstaller"
-                                Name="thelio-io"
-                                DisplayName="System76 Thelio Io"
-                                Type="ownProcess"
-                                Account="LocalSystem"
-                                Start="auto"
-                                ErrorControl="normal"/>
-                            <ServiceControl
-                                Id="ServiceControl"
-                                Name="thelio-io"
-                                Start="install"
-                                Stop="both"
-                                Remove="uninstall"
-                                Wait="yes"/>
-                            <util:EventSource
-                                Log="Application"
-                                Name="System76 Thelio Io"
-                                EventMessageFile="[#exe0]"/>
-                        </Component>
-                        <Component Id='binary1' Guid='*' Win64='$(var.Win64)'>
-                            <File
-                                Id='exe1'
-                                Name='thelio-io_wrapper.exe'
-                                DiskId='1'
-                                Source='wrapper\bin\Release\net8.0-windows\win-x64\publish\wrapper.exe'
-                                KeyPath='yes'/>
-                        </Component>
-                    </Directory>
+                    <Component Id="WrapperComponent" Bitness="always64">
+                        <File Id="WrapperExe"
+                              Name="thelio-io_wrapper.exe"
+                              Source="wrapper\bin\Release\net8.0-windows\win-x64\publish\wrapper.exe"
+                              KeyPath="yes" />
+                    </Component>
+
+                    <Component Id="CliComponent" Bitness="always64">
+                        <File Id="CliExe"
+                              Name="thelio-io-cli.exe"
+                              Source="target\$(var.Profile)\thelio-io-cli.exe"
+                              KeyPath="yes" />
+                    </Component>
                 </Directory>
             </Directory>
-        </Directory>
+        </StandardDirectory>
 
-        <Feature Id="VCRedist" Title="Visual C++ 2019 Runtime" AllowAdvertise="no" Display="hidden" Level="1">
-            <MergeRef Id="VCRedist"/>
+        <Feature Id="MainFeature"
+                 Title="Application"
+                 Description="Installs the Thelio Io fan controller service and utilities."
+                 Level="1"
+                 ConfigurableDirectory="APPLICATIONFOLDER"
+                 AllowAdvertise="no"
+                 AllowAbsent="no">
+            <ComponentRef Id="License" />
+            <ComponentRef Id="ServiceComponent" />
+            <ComponentRef Id="WrapperComponent" />
+            <ComponentRef Id="CliComponent" />
         </Feature>
-
-        <Feature
-            Id='Binaries'
-            Title='Application'
-            Description='Installs all binaries and the license.'
-            Level='1'
-            ConfigurableDirectory='APPLICATIONFOLDER'
-            AllowAdvertise='no'
-            Display='expand'
-            Absent='disallow'>
-            <!--
-              Comment out or remove the following `ComponentRef` tag to remove
-              the license sidecar file from the installer.
-            -->
-            <ComponentRef Id='License'/>
-
-            <ComponentRef Id='binary0'/>
-
-            <ComponentRef Id='binary1'/>
-        </Feature>
-
-        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
-
-
-        <!--
-          Uncomment the following `Icon` and `Property` tags to change the product icon.
-
-          The product icon is the graphic that appears in the Add/Remove
-          Programs control panel for the application.
-        -->
-        <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
-        <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
-
-        <Property Id='ARPHELPLINK' Value='https://github.com/system76/thelio-io-windows'/>
 
         <UI>
-            <UIRef Id='WixUI_FeatureTree'/>
-            <!--
-              Disabling the EULA dialog in the installer is a two step process:
-
-                 1. Uncomment the following two `Publish` tags
-                 2. Comment out or remove the `<WiXVariable Id='WixUILicenseRtf'...` tag further down
-
-            -->
-            <!--<Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>-->
-            <!--<Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>-->
-
+            <ui:WixUI Id="WixUI_FeatureTree" />
         </UI>
 
-        <!--
-          Disabling the EULA dialog in the installer requires commenting out
-          or removing the following `WixVariable` tag
-        -->
-        <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+        <WixVariable Id="WixUILicenseRtf" Value="wix\License.rtf" />
 
-
-        <!--
-          Uncomment the next `WixVaraible` tag to customize the installer's
-          Graphical User Interface (GUI) and add a custom banner image across
-          the top of each screen. See the WiX Toolset documentation for details
-          about customization.
-
-          The banner BMP dimensions are 493 x 58 pixels.
-        -->
-        <!--<WixVariable Id='WixUIBannerBmp' Value='wix\Banner.bmp'/>-->
-
-
-        <!--
-          Uncomment the next `WixVariable` tag to customize the installer's
-          Graphical User Interface (GUI) and add a custom image to the first
-          dialog, or screen. See the WiX Toolset documentation for details about
-          customization.
-
-          The dialog BMP dimensions are 493 x 312 pixels.
-        -->
-        <!--<WixVariable Id='WixUIDialogBmp' Value='wix\Dialog.bmp'/>-->
-
-    </Product>
-
+    </Package>
 </Wix>

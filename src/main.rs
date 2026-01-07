@@ -1,4 +1,4 @@
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::{
     ffi::OsString,
     io,
@@ -10,7 +10,7 @@ use std::{
 };
 use thelio_io::{
     daemon,
-    fan::{FanCurve, FanController, ThrottleStatus},
+    fan::{FanCurve, FanController},
 };
 use windows_service::{
     define_windows_service,
@@ -25,17 +25,29 @@ use windows_service::{
     service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
 };
+use winreg::enums::*;
+use winreg::RegKey;
+
+/// Registry key for fan controller settings
+const REGISTRY_KEY: &str = r"SOFTWARE\ThelioIo";
+
+/// Read a DWORD value from registry, returning None if not found
+fn read_registry_dword(name: &str) -> Option<u32> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = hklm.open_subkey(REGISTRY_KEY).ok()?;
+    key.get_value::<u32, _>(name).ok()
+}
 
 /// Logging callback for service mode
 struct LogCallback {
-    /// Track previous throttle status to avoid spamming logs
-    last_throttle_status: ThrottleStatus,
+    /// Track previous sustained load state to avoid spamming logs
+    was_sustained: bool,
 }
 
 impl LogCallback {
     fn new() -> Self {
         Self {
-            last_throttle_status: ThrottleStatus::None,
+            was_sustained: false,
         }
     }
 }
@@ -45,60 +57,29 @@ impl daemon::DaemonCallback for LogCallback {
         // Log fan duty changes
         if output.duty_changed {
             debug!(
-                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({}) [CPU: {}/{}MHz {:.1}%, GPU: {}/{}MHz {:.1}%]",
+                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({}) [CPU: {:.1}%, GPU: {:.1}%]",
                 output.instant_temp as f32 / 100.0,
                 output.smoothed_temp as f32 / 100.0,
                 output.actual_duty as f32 / 100.0,
                 output.reason,
-                output.cpu_clock,
-                output.cpu_max_clock,
                 output.cpu_load,
-                output.gpu_clock,
-                output.gpu_max_clock,
                 output.gpu_load,
             );
         }
 
-        // Log throttle status changes
-        if output.throttle_status != self.last_throttle_status {
-            match output.throttle_status {
-                ThrottleStatus::None => {
-                    if self.last_throttle_status.is_throttling() {
-                        info!("Thermal throttling cleared - clocks restored");
-                    }
-                }
-                ThrottleStatus::Likely => {
-                    let cpu_pct = if output.cpu_max_clock > 0 {
-                        (output.cpu_clock as f32 / output.cpu_max_clock as f32) * 100.0
-                    } else { 100.0 };
-                    let gpu_pct = if output.gpu_max_clock > 0 {
-                        (output.gpu_clock as f32 / output.gpu_max_clock as f32) * 100.0
-                    } else { 100.0 };
-                    warn!(
-                        "Possible thermal throttling: {:.1}C, CPU {}/{}MHz ({:.0}%) load {:.1}%, GPU {}/{}MHz ({:.0}%) load {:.1}% - boosting curve +{}C",
-                        output.instant_temp as f32 / 100.0,
-                        output.cpu_clock, output.cpu_max_clock, cpu_pct, output.cpu_load,
-                        output.gpu_clock, output.gpu_max_clock, gpu_pct, output.gpu_load,
-                        output.throttle_boost / 100,
-                    );
-                }
-                ThrottleStatus::Confirmed => {
-                    let cpu_pct = if output.cpu_max_clock > 0 {
-                        (output.cpu_clock as f32 / output.cpu_max_clock as f32) * 100.0
-                    } else { 100.0 };
-                    let gpu_pct = if output.gpu_max_clock > 0 {
-                        (output.gpu_clock as f32 / output.gpu_max_clock as f32) * 100.0
-                    } else { 100.0 };
-                    warn!(
-                        "THROTTLING CONFIRMED: {:.1}C, CPU {}/{}MHz ({:.0}%) load {:.1}%, GPU {}/{}MHz ({:.0}%) load {:.1}% - boosting curve +{}C",
-                        output.instant_temp as f32 / 100.0,
-                        output.cpu_clock, output.cpu_max_clock, cpu_pct, output.cpu_load,
-                        output.gpu_clock, output.gpu_max_clock, gpu_pct, output.gpu_load,
-                        output.throttle_boost / 100,
-                    );
-                }
+        // Log sustained load state changes
+        if output.sustained_load != self.was_sustained {
+            if output.sustained_load {
+                info!(
+                    "Sustained load detected at {:.1}C, CPU {:.1}% - beginning gradual ramp",
+                    output.smoothed_temp as f32 / 100.0,
+                    output.cpu_load,
+                );
+            } else if self.was_sustained {
+                info!("Sustained load ended - holding duty at {:.1}%",
+                    output.actual_duty as f32 / 100.0);
             }
-            self.last_throttle_status = output.throttle_status;
+            self.was_sustained = output.sustained_load;
         }
     }
 }
@@ -114,48 +95,69 @@ fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
         .find_map(|sys: smbioslib::SMBiosSystemInformation| sys.version())
         .unwrap_or_default();
 
-    let curve = match (sys_vendor.as_str(), product_version.as_str()) {
+    // Validate this is a supported Thelio system
+    let is_supported = matches!(
+        (sys_vendor.as_str(), product_version.as_str()),
         ("System76", "thelio-mira-r1" | "thelio-mira-r2" | "thelio-mira-r3"
-                   | "thelio-mira-b1" | "thelio-mira-b2" | "thelio-mira-b3" | "thelio-mira-b4") => {
-            debug!("{} {} uses standard fan curve", sys_vendor, product_version);
-            FanCurve::standard()
-        }
-        ("System76", "thelio-major-r1") => {
-            debug!("{} {} uses threadripper2 fan curve", sys_vendor, product_version);
-            FanCurve::threadripper2()
-        }
-        ("System76", "thelio-major-r2" | "thelio-major-r2.1" | "thelio-major-b1" | "thelio-major-b2"
-                   | "thelio-major-b3" | "thelio-mega-r1" | "thelio-mega-r1.1") => {
-            debug!("{} {} uses hedt fan curve", sys_vendor, product_version);
-            FanCurve::hedt()
-        }
-        ("System76", "thelio-massive-b1") => {
-            debug!("{} {} uses xeon fan curve", sys_vendor, product_version);
-            FanCurve::xeon()
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "unsupported sys_vendor '{}' and product_version '{}'",
-                    sys_vendor, product_version
-                ),
-            ))
-        }
-    };
+                   | "thelio-mira-b1" | "thelio-mira-b2" | "thelio-mira-b3" | "thelio-mira-b4"
+                   | "thelio-major-r1" | "thelio-major-r2" | "thelio-major-r2.1"
+                   | "thelio-major-b1" | "thelio-major-b2" | "thelio-major-b3"
+                   | "thelio-mega-r1" | "thelio-mega-r1.1" | "thelio-massive-b1")
+    );
+
+    if !is_supported {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "unsupported sys_vendor '{}' and product_version '{}'",
+                sys_vendor, product_version
+            ),
+        ));
+    }
+
+    debug!("{} {} detected", sys_vendor, product_version);
+
+    // Read configuration from registry (with defaults)
+    // Values in hundredths: 85°C = 8500, 100% = 10000, 40% = 4000
+    let pbo_temp = read_registry_dword("PboTemp")
+        .map(|v| (v as i16) * 100)
+        .unwrap_or(85_00); // Default 85°C
+
+    let max_fan_duty = read_registry_dword("MaxFanDuty")
+        .map(|v| (v as u16) * 100)
+        .unwrap_or(100_00); // Default 100%
+
+    let silence_threshold = read_registry_dword("SilenceThreshold")
+        .map(|v| (v as u16) * 100)
+        .unwrap_or(40_00); // Default 40%
+
+    let sustained_load_threshold = read_registry_dword("SustainedLoadThreshold")
+        .map(|v| v as f32)
+        .unwrap_or(50.0); // Default 50% CPU
+
+    info!(
+        "Fan settings: PBO={}°C, MaxFan={}%, Silence={}%, LoadThreshold={}%",
+        pbo_temp / 100, max_fan_duty / 100, silence_threshold / 100, sustained_load_threshold
+    );
+
+    // Create PBO-based fan curve
+    let curve = FanCurve::pbo_curve(pbo_temp, max_fan_duty, silence_threshold);
 
     // Find Thelio Io devices
     let mut ios = daemon::find_thelio_io_devices()?;
     debug!("Found {} Thelio Io device(s)", ios.len());
 
-    // Create fan controller with smoothing and hysteresis
+    // Create fan controller with PBO-based settings
     let mut controller = FanController::new(curve)
         .with_smoothing_window(5)
-        .with_ramp_up_delay(1.5)  // Faster response (was 3.0)
         .with_ramp_down_delay(10.0)
-        .with_min_duty_change(2_00);
+        .with_min_duty_change(2_00)
+        .with_pbo_temp(pbo_temp)
+        .with_max_fan_duty(max_fan_duty)
+        .with_silence_threshold(silence_threshold)
+        .with_sustained_load_threshold(sustained_load_threshold);
 
-    debug!("Fan controller initialized with smoothing and hysteresis");
+    debug!("Fan controller initialized with PBO-based curve");
 
     // Launch wrapper
     let mut wrapper = daemon::launch_wrapper()?;

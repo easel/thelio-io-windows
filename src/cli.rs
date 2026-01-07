@@ -54,7 +54,17 @@ fn cmd_status() {
 }
 
 fn cmd_run(curve_name: &str) {
+    // Default PBO settings (can be overridden by legacy curves)
+    let pbo_temp = 85_00i16;
+    let max_fan_duty = 100_00u16;
+    let silence_threshold = 40_00u16;
+    let sustained_load_threshold = 50.0f32;
+
     let curve = match curve_name {
+        "pbo" => {
+            println!("Using PBO-based fan curve (PBO=85°C, Max=100%, Silence=40%)");
+            FanCurve::pbo_curve(pbo_temp, max_fan_duty, silence_threshold)
+        }
         "standard" => {
             println!("Using STANDARD fan curve");
             FanCurve::standard()
@@ -76,17 +86,20 @@ fn cmd_run(curve_name: &str) {
             FanCurve::xeon()
         }
         _ => {
-            eprintln!("Unknown curve '{}'. Available: standard, quiet, threadripper2, hedt, xeon", curve_name);
+            eprintln!("Unknown curve '{}'. Available: pbo, standard, quiet, threadripper2, hedt, xeon", curve_name);
             return;
         }
     };
 
-    // Create controller with smoothing and hysteresis
+    // Create controller with PBO-based settings
     let mut controller = FanController::new(curve)
         .with_smoothing_window(5)
-        .with_ramp_up_delay(1.5)   // Faster response (matches service)
         .with_ramp_down_delay(10.0)
-        .with_min_duty_change(2_00);
+        .with_min_duty_change(2_00)
+        .with_pbo_temp(pbo_temp)
+        .with_max_fan_duty(max_fan_duty)
+        .with_silence_threshold(silence_threshold)
+        .with_sustained_load_threshold(sustained_load_threshold);
 
     // Find Thelio Io devices
     let mut ios = match daemon::find_thelio_io_devices() {

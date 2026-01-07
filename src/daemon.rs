@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{fan::{FanController, FanControllerOutput, SensorData, ThrottleStatus}, Io};
+use crate::{fan::{FanController, FanControllerOutput, SensorData}, Io};
 
 /// All fan device headers on Thelio Io
 pub const FAN_DEVICES: &[&str] = &["CPUF", "INTF", "EXHF"];
@@ -115,48 +115,34 @@ impl DaemonCallback for ConsoleCallback {
     fn on_update(&mut self, output: &FanControllerOutput) {
         if self.first {
             println!("Starting fan control loop (Ctrl+C to stop)");
-            println!("Smoothing: 5s window | Ramp-up: 1.5s delay | Ramp-down: 10s delay\n");
-            println!("{:>8} {:>8} {:>8} {:>8} {:>10} {:>6} {:>10} {:>6} {:>14}",
-                "Instant", "Avg", "Target", "Actual", "CPU Clk", "CPU%", "GPU Clk", "GPU%", "State");
-            println!("{}", "-".repeat(100));
+            println!("PBO-based curve | Ramp-down: 10s delay\n");
+            println!("{:>8} {:>8} {:>8} {:>8} {:>7} {:>7} {:>8} {:>20}",
+                "Instant", "Avg", "Target", "Actual", "CPU%", "GPU%", "Sustain", "State");
+            println!("{}", "-".repeat(90));
             self.first = false;
         }
 
         let change_marker = if output.duty_changed { "*" } else { " " };
 
-        // Format throttle indicator with boost info
-        let throttle_indicator = match output.throttle_status {
-            ThrottleStatus::None => String::new(),
-            ThrottleStatus::Likely => format!(" [THROTTLE? +{}C]", output.throttle_boost / 100),
-            ThrottleStatus::Confirmed => format!(" [THROTTLING +{}C]", output.throttle_boost / 100),
-        };
-
-        // Format CPU clock as "current/max MHz" or empty if no data
-        let cpu_clock_str = if output.cpu_max_clock > 0 {
-            format!("{:>4}/{:<4}", output.cpu_clock, output.cpu_max_clock)
+        // Format sustained load indicator
+        let sustained_str = if output.sustained_load {
+            format!("{:>5.0}s*", output.sustained_secs)
+        } else if output.sustained_secs > 0.0 {
+            format!("{:>5.0}s", output.sustained_secs)
         } else {
-            "   -    ".to_string()
+            "     -".to_string()
         };
 
-        // Format GPU clock as "current/max MHz" or empty if no data
-        let gpu_clock_str = if output.gpu_max_clock > 0 {
-            format!("{:>4}/{:<4}", output.gpu_clock, output.gpu_max_clock)
-        } else {
-            "   -    ".to_string()
-        };
-
-        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {} {:>5.1}% {} {:>5.1}% {:>12}{}",
+        println!("{:>7.1}C {:>7.1}C {:>7.1}% {:>7.1}%{} {:>6.1}% {:>6.1}% {:>8} {:>20}",
             output.instant_temp as f32 / 100.0,
             output.smoothed_temp as f32 / 100.0,
             output.target_duty as f32 / 100.0,
             output.actual_duty as f32 / 100.0,
             change_marker,
-            cpu_clock_str,
             output.cpu_load,
-            gpu_clock_str,
             output.gpu_load,
+            sustained_str,
             output.reason,
-            throttle_indicator,
         );
     }
 }

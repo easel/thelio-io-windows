@@ -344,6 +344,21 @@ impl FanCurve {
             .append(95_00, 100_00)  // 100% only at 95°C
     }
 
+    /// PBO-based fan curve with configurable parameters.
+    ///
+    /// Creates a simple curve:
+    /// - 40°C = 0%
+    /// - 60°C = silence% (linear interpolation from 40-60°C)
+    /// - PBO temp = max_fan% (linear interpolation from 60°C to PBO)
+    ///
+    /// Arguments are in hundredths (e.g., 85_00 = 85°C, 40_00 = 40%)
+    pub fn pbo_curve(pbo_temp: i16, max_fan_duty: u16, silence_threshold: u16) -> Self {
+        Self::default()
+            .append(40_00, 0_00)           // 0% at 40°C
+            .append(60_00, silence_threshold) // silence% at 60°C
+            .append(pbo_temp, max_fan_duty)   // max_fan% at PBO temp
+    }
+
     pub fn get_duty(&self, temp: i16) -> Option<u16> {
         // If the temp is less than the first point, return the first point duty
         if let Some(first) = self.points.first() {
@@ -375,13 +390,13 @@ impl FanCurve {
     }
 }
 
-/// Fan controller with temperature smoothing and hysteresis.
+/// Fan controller with PBO-based curve and gradual ramp.
 ///
-/// This prevents "fan panic" from short temperature spikes common on modern CPUs
-/// (especially AMD Zen 3) by:
-/// - Averaging temperature over a rolling window
-/// - Delaying fan speed increases (ramp-up delay)
-/// - Delaying fan speed decreases even more (ramp-down delay)
+/// Designed around PBO temperature limits to avoid jet-engine behavior:
+/// - Fast ramp to silence threshold (inaudible range)
+/// - Hold at silence% for transient spikes
+/// - Gradual +1%/sec ramp when sustained at PBO temp with 100% CPU load
+/// - Critical override at PBO+2°C for thermal emergencies
 pub struct FanController {
     curve: FanCurve,
     /// Rolling window of temperature readings (in hundredths of a degree)
@@ -390,47 +405,49 @@ pub struct FanController {
     smoothing_window: usize,
     /// Current fan duty (hundredths of a percent)
     current_duty: u16,
-    /// When we last increased fan speed
-    last_increase: Option<Instant>,
     /// When we last decreased fan speed
     last_decrease: Option<Instant>,
-    /// Seconds to wait before ramping up
-    ramp_up_delay_secs: f32,
     /// Seconds to wait before ramping down
     ramp_down_delay_secs: f32,
     /// Minimum duty change to act on (prevents micro-adjustments)
     min_duty_change: u16,
-    /// Throttle detector for monitoring thermal throttling
-    throttle_detector: ThrottleDetector,
-    /// Temperature boost when throttling is "likely" (hundredths of a degree)
-    throttle_boost_likely: i16,
-    /// Temperature boost when throttling is "confirmed" (hundredths of a degree)
-    throttle_boost_confirmed: i16,
+    /// PBO temperature limit (hundredths of a degree, e.g., 85_00 = 85°C)
+    pbo_temp: i16,
+    /// Maximum fan duty (hundredths of a percent, e.g., 100_00 = 100%)
+    max_fan_duty: u16,
+    /// Silence threshold - fans inaudible below this (hundredths of a percent)
+    silence_threshold: u16,
+    /// When sustained load (high CPU at PBO temp) started
+    sustained_load_start: Option<Instant>,
+    /// CPU load threshold for sustained load detection (0-100)
+    sustained_load_threshold: f32,
 }
 
 impl FanController {
-    /// Create a new fan controller with default settings optimized for Zen 3.
+    /// Create a new fan controller with default PBO-based settings.
     ///
     /// Defaults:
     /// - 5 second temperature smoothing window
-    /// - 3 second ramp-up delay
     /// - 10 second ramp-down delay
     /// - 200 (2%) minimum duty change
-    /// - 5°C boost when throttling likely, 10°C when confirmed
+    /// - PBO temp: 85°C
+    /// - Max fan duty: 100%
+    /// - Silence threshold: 40%
+    /// - Sustained load threshold: 50% CPU
     pub fn new(curve: FanCurve) -> Self {
         Self {
             curve,
             temp_history: VecDeque::with_capacity(10),
             smoothing_window: 5,
             current_duty: 0,
-            last_increase: None,
             last_decrease: None,
-            ramp_up_delay_secs: 3.0,
             ramp_down_delay_secs: 10.0,
             min_duty_change: 2_00, // 2%
-            throttle_detector: ThrottleDetector::new(),
-            throttle_boost_likely: 5_00,    // +5°C
-            throttle_boost_confirmed: 10_00, // +10°C
+            pbo_temp: 85_00,       // 85°C
+            max_fan_duty: 100_00,  // 100%
+            silence_threshold: 40_00, // 40%
+            sustained_load_start: None,
+            sustained_load_threshold: 50.0, // 50% CPU
         }
     }
 
@@ -438,12 +455,6 @@ impl FanController {
     pub fn with_smoothing_window(mut self, samples: usize) -> Self {
         self.smoothing_window = samples.max(1);
         self.temp_history = VecDeque::with_capacity(samples + 5);
-        self
-    }
-
-    /// Configure ramp-up delay in seconds
-    pub fn with_ramp_up_delay(mut self, secs: f32) -> Self {
-        self.ramp_up_delay_secs = secs.max(0.0);
         self
     }
 
@@ -456,6 +467,30 @@ impl FanController {
     /// Configure minimum duty change threshold (in hundredths of a percent)
     pub fn with_min_duty_change(mut self, duty: u16) -> Self {
         self.min_duty_change = duty;
+        self
+    }
+
+    /// Configure PBO temperature limit (in hundredths of a degree)
+    pub fn with_pbo_temp(mut self, temp: i16) -> Self {
+        self.pbo_temp = temp;
+        self
+    }
+
+    /// Configure maximum fan duty (in hundredths of a percent)
+    pub fn with_max_fan_duty(mut self, duty: u16) -> Self {
+        self.max_fan_duty = duty;
+        self
+    }
+
+    /// Configure silence threshold (in hundredths of a percent)
+    pub fn with_silence_threshold(mut self, duty: u16) -> Self {
+        self.silence_threshold = duty;
+        self
+    }
+
+    /// Configure sustained load CPU threshold (0-100%)
+    pub fn with_sustained_load_threshold(mut self, load: f32) -> Self {
+        self.sustained_load_threshold = load;
         self
     }
 
@@ -485,28 +520,32 @@ impl FanController {
         self.update_with_sensors(&data)
     }
 
-    /// Critical temperature threshold (hundredths of a degree) - 85°C
-    /// Above this, immediately jump to 100% fans bypassing all delays
-    const CRITICAL_TEMP: i16 = 85_00;
+    /// Seconds of sustained load required before allowing ramp above silence threshold
+    const SUSTAINED_LOAD_REQUIRED_SECS: f32 = 10.0;
 
-    /// Update the controller with full sensor data including throttle detection.
+    /// Ramp rate when sustained load detected: duty increase per second (hundredths)
+    /// 1% per second = 60 seconds from silence (40%) to max (100%)
+    const RAMP_RATE_PER_SEC: u16 = 1_00;
+
+    /// Update the controller with full sensor data.
     /// Returns the duty cycle to set (if it should change) and debug info.
     pub fn update_with_sensors(&mut self, data: &SensorData) -> FanControllerOutput {
         let now = Instant::now();
         let temp = data.temp;
 
-        // CRITICAL TEMPERATURE OVERRIDE - bypass all delays for safety
-        if temp >= Self::CRITICAL_TEMP {
+        // Critical temperature = PBO + 2°C - bypass all delays for safety
+        let critical_temp = self.pbo_temp + 2_00;
+        if temp >= critical_temp {
             self.temp_history.push_back(temp);
             while self.temp_history.len() > self.smoothing_window {
                 self.temp_history.pop_front();
             }
 
-            // Force 100% immediately
+            // Force 100% immediately (always 100%, not max_fan_duty - this is emergency)
             let was_duty = self.current_duty;
             self.current_duty = 100_00;
-            self.last_increase = Some(now);
             self.last_decrease = None;
+            self.sustained_load_start = None;
 
             return FanControllerOutput {
                 instant_temp: temp,
@@ -515,28 +554,14 @@ impl FanController {
                 actual_duty: 100_00,
                 duty_changed: was_duty != 100_00,
                 reason: "CRITICAL TEMP",
-                throttle_status: ThrottleStatus::Confirmed, // Assume throttling at critical temps
-                throttle_boost: 0,
+                sustained_load: false,
+                sustained_secs: 0.0,
                 cpu_temp: data.cpu_temp,
-                cpu_clock: data.cpu_clock,
-                cpu_max_clock: data.cpu_max_clock,
                 cpu_load: data.cpu_load,
                 gpu_temp: data.gpu_temp,
-                gpu_clock: data.gpu_clock,
-                gpu_max_clock: data.gpu_max_clock,
                 gpu_load: data.gpu_load,
             };
         }
-
-        // Analyze throttle status
-        let throttle_status = self.throttle_detector.analyze(data);
-
-        // Apply temperature boost if throttling detected
-        let throttle_boost = match throttle_status {
-            ThrottleStatus::None => 0,
-            ThrottleStatus::Likely => self.throttle_boost_likely,
-            ThrottleStatus::Confirmed => self.throttle_boost_confirmed,
-        };
 
         // Add to history, maintain window size
         self.temp_history.push_back(temp);
@@ -545,9 +570,27 @@ impl FanController {
         }
 
         let smoothed_temp = self.smoothed_temp();
-        // Apply boost to the temperature used for curve lookup
-        let boosted_temp = smoothed_temp.saturating_add(throttle_boost);
-        let target_duty = self.curve.get_duty(boosted_temp).unwrap_or(0);
+        let target_duty = self.curve.get_duty(smoothed_temp).unwrap_or(0)
+            .min(self.max_fan_duty); // Cap at max_fan_duty
+
+        // Check for sustained load condition: high CPU AND temp >= PBO temp
+        let is_at_pbo_load = data.cpu_load >= self.sustained_load_threshold && smoothed_temp >= self.pbo_temp;
+
+        // Track sustained load duration
+        let sustained_secs = if is_at_pbo_load {
+            match self.sustained_load_start {
+                Some(start) => now.duration_since(start).as_secs_f32(),
+                None => {
+                    self.sustained_load_start = Some(now);
+                    0.0
+                }
+            }
+        } else {
+            self.sustained_load_start = None;
+            0.0
+        };
+
+        let sustained_load = sustained_secs >= Self::SUSTAINED_LOAD_REQUIRED_SECS;
 
         let mut output = FanControllerOutput {
             instant_temp: temp,
@@ -556,61 +599,50 @@ impl FanController {
             actual_duty: self.current_duty,
             duty_changed: false,
             reason: "holding",
-            throttle_status,
-            throttle_boost,
+            sustained_load,
+            sustained_secs,
             cpu_temp: data.cpu_temp,
-            cpu_clock: data.cpu_clock,
-            cpu_max_clock: data.cpu_max_clock,
             cpu_load: data.cpu_load,
             gpu_temp: data.gpu_temp,
-            gpu_clock: data.gpu_clock,
-            gpu_max_clock: data.gpu_max_clock,
             gpu_load: data.gpu_load,
         };
 
-        // Calculate duty difference
-        let duty_diff = (target_duty as i32 - self.current_duty as i32).abs() as u16;
-
-        // Ignore changes smaller than threshold (unless it's a big jump for safety)
-        if duty_diff < self.min_duty_change && target_duty < 100_00 {
-            return output;
-        }
-
         if target_duty > self.current_duty {
             // Want to increase fan speed
-            let should_increase = match self.last_increase {
-                None => {
-                    // First increase request - start the timer
-                    self.last_increase = Some(now);
-                    // But allow immediate increase if it's a large jump (safety)
-                    duty_diff >= 10_00 // 10% jump = immediate
-                }
-                Some(last) => {
-                    // Check if we've waited long enough
-                    now.duration_since(last).as_secs_f32() >= self.ramp_up_delay_secs
-                }
-            };
-
-            if should_increase {
-                self.current_duty = target_duty;
-                self.last_increase = Some(now);
+            if self.current_duty < self.silence_threshold {
+                // Below silence threshold - ramp quickly (it's inaudible)
+                self.current_duty = target_duty.min(self.silence_threshold);
                 self.last_decrease = None;
-                output.actual_duty = target_duty;
+                output.actual_duty = self.current_duty;
                 output.duty_changed = true;
-                output.reason = "ramp-up";
+                output.reason = "ramp-up (quiet)";
+            } else if sustained_load {
+                // Above silence threshold with sustained load - gradual +1%/sec
+                let new_duty = (self.current_duty + Self::RAMP_RATE_PER_SEC).min(target_duty);
+                if new_duty != self.current_duty {
+                    self.current_duty = new_duty;
+                    self.last_decrease = None;
+                    output.actual_duty = self.current_duty;
+                    output.duty_changed = true;
+                    output.reason = "ramp-up (sustained)";
+                }
             } else {
-                output.reason = "ramp-up delayed";
+                // Above silence threshold without sustained load - hold at silence
+                if self.current_duty > self.silence_threshold {
+                    // Already above silence, just hold
+                    output.reason = "holding (no sustained load)";
+                } else {
+                    output.reason = "holding at silence";
+                }
             }
         } else if target_duty < self.current_duty {
-            // Want to decrease fan speed
+            // Want to decrease fan speed - use existing ramp-down delay
             let should_decrease = match self.last_decrease {
                 None => {
-                    // First decrease request - start the timer
                     self.last_decrease = Some(now);
                     false
                 }
                 Some(last) => {
-                    // Check if we've waited long enough
                     now.duration_since(last).as_secs_f32() >= self.ramp_down_delay_secs
                 }
             };
@@ -618,7 +650,6 @@ impl FanController {
             if should_decrease {
                 self.current_duty = target_duty;
                 self.last_decrease = Some(now);
-                self.last_increase = None;
                 output.actual_duty = target_duty;
                 output.duty_changed = true;
                 output.reason = "ramp-down";
@@ -626,8 +657,6 @@ impl FanController {
                 output.reason = "ramp-down delayed";
             }
         } else {
-            // No change needed
-            self.last_increase = None;
             self.last_decrease = None;
             output.reason = "steady";
         }
@@ -661,24 +690,16 @@ pub struct FanControllerOutput {
     pub duty_changed: bool,
     /// Why we made this decision
     pub reason: &'static str,
-    /// Thermal throttle status (worst of CPU/GPU)
-    pub throttle_status: ThrottleStatus,
-    /// Temperature boost applied due to throttling (hundredths of a degree)
-    pub throttle_boost: i16,
+    /// Whether sustained load condition is active
+    pub sustained_load: bool,
+    /// Seconds of sustained load (0 if not sustained)
+    pub sustained_secs: f32,
     /// CPU temperature (hundredths of a degree)
     pub cpu_temp: i16,
-    /// Current CPU clock in MHz
-    pub cpu_clock: u32,
-    /// Max observed CPU clock in MHz
-    pub cpu_max_clock: u32,
     /// CPU load percentage
     pub cpu_load: f32,
     /// GPU temperature (hundredths of a degree)
     pub gpu_temp: i16,
-    /// Current GPU clock in MHz
-    pub gpu_clock: u32,
-    /// Max observed GPU clock in MHz
-    pub gpu_max_clock: u32,
     /// GPU load percentage
     pub gpu_load: f32,
 }
@@ -724,10 +745,9 @@ mod tests {
 
     #[test]
     fn test_controller_temperature_smoothing() {
-        let curve = FanCurve::standard();
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(3)
-            .with_ramp_up_delay(0.0)  // No delay for this test
             .with_ramp_down_delay(0.0);
 
         // Feed varying temperatures
@@ -741,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_controller_smoothing_window_size() {
-        let curve = FanCurve::standard();
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(2);
 
@@ -757,55 +777,70 @@ mod tests {
     }
 
     #[test]
-    fn test_controller_ramp_up_delay() {
-        let curve = FanCurve::standard();
+    fn test_controller_ramp_to_silence() {
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(1)
-            .with_ramp_up_delay(0.1)  // 100ms delay
-            .with_ramp_down_delay(10.0)
-            .with_min_duty_change(0);  // React to any change
+            .with_pbo_temp(85_00)
+            .with_silence_threshold(40_00);
 
-        // Start at moderate temp (60C = 40% duty)
-        controller.update(60_00);
-        sleep(Duration::from_millis(10));
-        controller.update(60_00);
+        // Start cold
+        controller.update(40_00);
 
-        // Small increase (63C = ~44% duty) - only ~4% change, should delay
-        // (10%+ change triggers immediate ramp-up for safety)
-        let output = controller.update(63_00);
-        assert_eq!(output.reason, "ramp-up delayed");
-        assert!(!output.duty_changed);
-
-        // Wait for delay
-        sleep(Duration::from_millis(150));
-
-        // Now it should ramp up
-        let output = controller.update(63_00);
+        // Go to 60C - should ramp quickly to 40% (silence threshold)
+        let output = controller.update(60_00);
         assert!(output.duty_changed);
-        assert_eq!(output.reason, "ramp-up");
+        assert_eq!(output.actual_duty, 40_00);
+        assert_eq!(output.reason, "ramp-up (quiet)");
+    }
+
+    #[test]
+    fn test_controller_holds_at_silence_without_sustained_load() {
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
+        let mut controller = FanController::new(curve)
+            .with_smoothing_window(1)
+            .with_pbo_temp(85_00)
+            .with_silence_threshold(40_00);
+
+        // Get to silence threshold
+        controller.update(60_00);
+
+        // Go higher (75C) but without sustained load - should hold at silence
+        let data = SensorData {
+            temp: 75_00,
+            cpu_temp: 75_00,
+            cpu_clock: 0,
+            cpu_max_clock: 0,
+            cpu_load: 50.0,  // Not 100% load
+            gpu_temp: 60_00,
+            gpu_clock: 0,
+            gpu_max_clock: 0,
+            gpu_load: 30.0,
+        };
+        let output = controller.update_with_sensors(&data);
+
+        // Should hold at silence threshold
+        assert_eq!(output.actual_duty, 40_00);
+        assert!(output.reason.contains("holding"));
     }
 
     #[test]
     fn test_controller_ramp_down_delay() {
-        let curve = FanCurve::standard();
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(1)
-            .with_ramp_up_delay(0.0)
             .with_ramp_down_delay(0.1)  // 100ms delay
-            .with_min_duty_change(0);
+            .with_pbo_temp(85_00);
 
-        // Start hot (but below critical 85°C to avoid override), let it ramp up
-        controller.update(84_00);  // ~88% duty at 84°C
-        sleep(Duration::from_millis(10));
-        let output = controller.update(84_00);
-        let hot_duty = output.actual_duty;
-        assert!(hot_duty > 80_00);  // Should be high duty
+        // Start at silence threshold
+        controller.update(60_00);
+        let output = controller.update(60_00);
+        assert_eq!(output.actual_duty, 40_00);
 
         // Go cold - should delay ramp down
         let output = controller.update(40_00);
         assert!(!output.duty_changed);
         assert_eq!(output.reason, "ramp-down delayed");
-        assert_eq!(output.actual_duty, hot_duty);  // Still at hot duty
 
         // Wait for delay
         sleep(Duration::from_millis(150));
@@ -817,88 +852,75 @@ mod tests {
     }
 
     #[test]
-    fn test_controller_immediate_large_jump() {
-        let curve = FanCurve::standard();
-        let mut controller = FanController::new(curve)
-            .with_smoothing_window(1)
-            .with_ramp_up_delay(10.0)  // Long delay
-            .with_min_duty_change(0);
-
-        // Start at 0% duty
-        controller.update(40_00);
-
-        // Large jump (>10% duty change) should be immediate for safety
-        // Use 82°C which is ~75% duty - a big jump from 0%
-        let output = controller.update(82_00);
-
-        // Should change immediately despite delay
-        assert!(output.duty_changed);
-    }
-
-    #[test]
     fn test_controller_critical_temp_override() {
-        let curve = FanCurve::standard();
+        // Critical temp = PBO + 2°C = 87°C
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(5)  // Long smoothing
-            .with_ramp_up_delay(10.0)  // Long delay
-            .with_min_duty_change(10_00);  // High threshold
+            .with_pbo_temp(85_00);
 
         // Start cold
         controller.update(40_00);
 
-        // Critical temp (85°C+) should immediately jump to 100%, bypassing all delays
-        let output = controller.update(85_00);
+        // Critical temp (87°C = PBO+2) should immediately jump to 100%
+        let output = controller.update(87_00);
         assert!(output.duty_changed);
         assert_eq!(output.actual_duty, 100_00);
         assert_eq!(output.reason, "CRITICAL TEMP");
 
-        // Even higher critical temp
+        // Even higher
         let output = controller.update(95_00);
         assert_eq!(output.actual_duty, 100_00);
         assert_eq!(output.reason, "CRITICAL TEMP");
     }
 
     #[test]
-    fn test_controller_min_duty_change_threshold() {
-        let curve = FanCurve::standard();
+    fn test_controller_steady_state() {
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(1)
-            .with_ramp_up_delay(0.0)
-            .with_ramp_down_delay(0.0)
-            .with_min_duty_change(5_00);  // 5% threshold
+            .with_ramp_down_delay(0.0);
 
-        // Get to a baseline
-        controller.update(70_00);
-        sleep(Duration::from_millis(10));
-        let output = controller.update(70_00);
-        let baseline_duty = output.actual_duty;
+        // Reach steady state at silence threshold
+        controller.update(60_00);
+        controller.update(60_00);
 
-        // Small temp change that would cause <5% duty change
-        let output = controller.update(71_00);
-
-        // Should not change due to threshold
-        assert!(!output.duty_changed);
-        assert_eq!(output.actual_duty, baseline_duty);
+        // Same temp again
+        let output = controller.update(60_00);
+        assert_eq!(output.reason, "steady");
     }
 
     #[test]
-    fn test_controller_steady_state() {
-        let curve = FanCurve::standard();
+    fn test_pbo_curve_interpolation() {
+        // 85°C PBO, 100% max, 40% silence
+        let curve = FanCurve::pbo_curve(85_00, 100_00, 40_00);
+
+        // Below 40C - should return 0%
+        assert_eq!(curve.get_duty(30_00), Some(0));
+
+        // At exact points
+        assert_eq!(curve.get_duty(40_00), Some(0));        // 0% at 40°C
+        assert_eq!(curve.get_duty(60_00), Some(40_00));    // 40% at 60°C
+        assert_eq!(curve.get_duty(85_00), Some(100_00));   // 100% at 85°C
+
+        // Interpolated: 72.5°C should be 70% (midpoint between 60°C/40% and 85°C/100%)
+        let duty_at_72 = curve.get_duty(72_50).unwrap();
+        assert!(duty_at_72 > 60_00 && duty_at_72 < 80_00);
+    }
+
+    #[test]
+    fn test_max_fan_duty_cap() {
+        // 85°C PBO, 50% max (capped), 40% silence
+        let curve = FanCurve::pbo_curve(85_00, 50_00, 40_00);
         let mut controller = FanController::new(curve)
             .with_smoothing_window(1)
-            .with_ramp_up_delay(0.0)
-            .with_ramp_down_delay(0.0)
-            .with_min_duty_change(0);
+            .with_pbo_temp(85_00)
+            .with_max_fan_duty(50_00)
+            .with_silence_threshold(40_00);
 
-        // Reach steady state
-        controller.update(70_00);
-        sleep(Duration::from_millis(10));
-        controller.update(70_00);
-
-        // Same temp again
-        let output = controller.update(70_00);
-
-        assert_eq!(output.reason, "steady");
+        // At 85°C, should cap at 50% not 100%
+        let output = controller.update(85_00);
+        assert!(output.actual_duty <= 50_00);
     }
 
     #[test]

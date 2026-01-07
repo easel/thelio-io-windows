@@ -13,6 +13,7 @@ smbios-lib = "0.7.3"
 log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
 winlog = "0.2"
 windows-service = "0.3"
+winreg = "0.52"
 
 [build-dependencies]
 winres = "0.1"
