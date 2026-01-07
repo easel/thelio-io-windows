@@ -208,8 +208,8 @@ fn cmd_temps() {
 
 fn cmd_curves() {
     println!("Available fan curves:\n");
-    println!("STANDARD (default):");
-    println!("  60C->25%  65C->30%  70C->35%  75C->45%  80C->55%  83C->63%  85C->70%  88C->85%  90C->100%");
+    println!("STANDARD (default) - optimized for PBO @ 85C:");
+    println!("  40C->0%  60C->40%  75C->60%  80C->80%  85C->100%");
     println!();
     println!("QUIET:");
     println!("  55C->25%  65C->30%  75C->40%  80C->50%  83C->60%  86C->70%  89C->80%  92C->90%  95C->100%");

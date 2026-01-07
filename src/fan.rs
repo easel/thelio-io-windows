@@ -271,18 +271,22 @@ impl FanCurve {
         self
     }
 
-    /// The standard fan curve - more aggressive at high temps to prevent thermal throttling
+    /// The standard fan curve optimized for PBO @ 85°C
+    /// - 40-60°C: 0% → 40% (ramp to near-silent, 40% is almost silent)
+    /// - 60-75°C: 40% → 60% (slow ramp, still quiet)
+    /// - 75-85°C: 60% → 100% (smooth ramp to aggressive)
     pub fn standard() -> Self {
         Self::default()
-            .append(59_99, 0_00)    // Fans off until 60°C
-            .append(60_00, 25_00)   // 25% at 60°C
-            .append(65_00, 30_00)   // 30% at 65°C
-            .append(70_00, 40_00)   // 40% at 70°C (was 35%)
-            .append(75_00, 55_00)   // 55% at 75°C (was 45%)
-            .append(80_00, 70_00)   // 70% at 80°C (was 55%)
-            .append(83_00, 80_00)   // 80% at 83°C (was 63%)
-            .append(85_00, 90_00)   // 90% at 85°C (was 70%) - critical temp threshold
-            .append(87_00, 100_00)  // 100% at 87°C (was 90°C)
+            .append(40_00, 0_00)    // 0% at 40°C
+            .append(60_00, 40_00)   // 40% at 60°C (near-silent)
+            .append(65_00, 47_00)   // 47% at 65°C
+            .append(70_00, 53_00)   // 53% at 70°C
+            .append(75_00, 60_00)   // 60% at 75°C (start aggressive ramp)
+            .append(78_00, 72_00)   // 72% at 78°C
+            .append(80_00, 80_00)   // 80% at 80°C
+            .append(82_00, 88_00)   // 88% at 82°C
+            .append(84_00, 95_00)   // 95% at 84°C
+            .append(85_00, 100_00)  // 100% at 85°C (matches PBO limit)
     }
 
     /// Fan curve for threadripper 2
@@ -690,18 +694,20 @@ mod tests {
         let curve = FanCurve::standard();
 
         // Below first point - should return first duty
-        assert_eq!(curve.get_duty(40_00), Some(0));
+        assert_eq!(curve.get_duty(30_00), Some(0));
 
         // At exact points
-        assert_eq!(curve.get_duty(65_00), Some(30_00));
-        assert_eq!(curve.get_duty(87_00), Some(100_00));  // Now 100% at 87°C
+        assert_eq!(curve.get_duty(40_00), Some(0));       // 0% at 40°C
+        assert_eq!(curve.get_duty(60_00), Some(40_00));   // 40% at 60°C
+        assert_eq!(curve.get_duty(75_00), Some(60_00));   // 60% at 75°C
+        assert_eq!(curve.get_duty(85_00), Some(100_00));  // 100% at 85°C
 
         // Above last point
         assert_eq!(curve.get_duty(95_00), Some(100_00));
 
-        // Interpolated value between 65C (30%) and 70C (40%)
-        let duty_at_67 = curve.get_duty(67_00).unwrap();
-        assert!(duty_at_67 > 30_00 && duty_at_67 < 40_00);
+        // Interpolated value between 60C (40%) and 65C (47%)
+        let duty_at_62 = curve.get_duty(62_00).unwrap();
+        assert!(duty_at_62 > 40_00 && duty_at_62 < 47_00);
     }
 
     #[test]
@@ -759,14 +765,14 @@ mod tests {
             .with_ramp_down_delay(10.0)
             .with_min_duty_change(0);  // React to any change
 
-        // Start at moderate temp (65C = 30% duty in new curve)
-        controller.update(65_00);
+        // Start at moderate temp (60C = 40% duty)
+        controller.update(60_00);
         sleep(Duration::from_millis(10));
-        controller.update(65_00);
+        controller.update(60_00);
 
-        // Small increase (68C = ~36% duty) - only 6% change, should delay
+        // Small increase (63C = ~44% duty) - only ~4% change, should delay
         // (10%+ change triggers immediate ramp-up for safety)
-        let output = controller.update(68_00);
+        let output = controller.update(63_00);
         assert_eq!(output.reason, "ramp-up delayed");
         assert!(!output.duty_changed);
 
@@ -774,7 +780,7 @@ mod tests {
         sleep(Duration::from_millis(150));
 
         // Now it should ramp up
-        let output = controller.update(68_00);
+        let output = controller.update(63_00);
         assert!(output.duty_changed);
         assert_eq!(output.reason, "ramp-up");
     }
