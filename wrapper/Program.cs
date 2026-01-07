@@ -20,8 +20,12 @@ namespace wrapper
             c.Open();
 
             // Track max observed clocks for throttle detection
-            float maxObservedCpuClock = 0;
-            float maxObservedGpuClock = 0;
+            // "Sustained" max = max seen during high load (>80%), better for PBO detection
+            // "Burst" max = max ever seen (includes single-core boost)
+            float maxSustainedCpuClock = 0;
+            float maxSustainedGpuClock = 0;
+            float maxBurstCpuClock = 0;
+            float maxBurstGpuClock = 0;
 
             while (true) {
                 // Wait for input - exits if stdin closes
@@ -137,31 +141,45 @@ namespace wrapper
 
                 // Calculate average CPU clock and track max observed
                 float avgCpuClock = cpuClocks.Count > 0 ? cpuClocks.Average() : 0;
-                if (avgCpuClock > maxObservedCpuClock) {
-                    maxObservedCpuClock = avgCpuClock;
+
+                // Track burst max (includes single-core boost)
+                if (avgCpuClock > maxBurstCpuClock) {
+                    maxBurstCpuClock = avgCpuClock;
+                }
+                if (gpuCoreClock > maxBurstGpuClock) {
+                    maxBurstGpuClock = gpuCoreClock;
                 }
 
-                // Track max observed GPU clock
-                if (gpuCoreClock > maxObservedGpuClock) {
-                    maxObservedGpuClock = gpuCoreClock;
+                // Track sustained max (only during high load - better for PBO)
+                // This is the relevant max for detecting thermal throttling
+                if (cpuTotalLoad >= 80 && avgCpuClock > maxSustainedCpuClock) {
+                    maxSustainedCpuClock = avgCpuClock;
                 }
+                if (gpuCoreLoad >= 80 && gpuCoreClock > maxSustainedGpuClock) {
+                    maxSustainedGpuClock = gpuCoreClock;
+                }
+
+                // Use sustained max for throttle detection, fall back to burst max if no sustained data yet
+                float cpuMaxForThrottle = maxSustainedCpuClock > 0 ? maxSustainedCpuClock : maxBurstCpuClock;
+                float gpuMaxForThrottle = maxSustainedGpuClock > 0 ? maxSustainedGpuClock : maxBurstGpuClock;
 
                 if (debugMode) {
                     Console.WriteLine($"CPU temp: {cpuTemp:F1}C (from {cpuTempSource})");
                     Console.WriteLine($"  Package: {cpuPackageTemp?.ToString("F1") ?? "N/A"}C, Core Max: {cpuCoreMax?.ToString("F1") ?? "N/A"}C, CCD Avg: {cpuCcdAvg?.ToString("F1") ?? "N/A"}C");
                     Console.WriteLine($"  Core temps: [{string.Join(", ", cpuCoreTemps.Select(t => $"{t:F1}"))}]");
-                    Console.WriteLine($"CPU clock: {avgCpuClock:F0} MHz (max seen: {maxObservedCpuClock:F0} MHz)");
+                    Console.WriteLine($"CPU clock: {avgCpuClock:F0} MHz (sustained max: {maxSustainedCpuClock:F0}, burst max: {maxBurstCpuClock:F0})");
                     Console.WriteLine($"CPU load: {cpuTotalLoad:F1}%");
                     Console.WriteLine($"GPU temp: {gpuTemp:F1}C from {gpuTempSource}");
-                    Console.WriteLine($"GPU clock: {gpuCoreClock:F0} MHz (max seen: {maxObservedGpuClock:F0} MHz)");
+                    Console.WriteLine($"GPU clock: {gpuCoreClock:F0} MHz (sustained max: {maxSustainedGpuClock:F0}, burst max: {maxBurstGpuClock:F0})");
                     Console.WriteLine($"GPU load: {gpuCoreLoad:F1}%");
                     Console.WriteLine($"REPORTED: {reportedTemp:F1}C");
                 } else {
                     // Output JSON for extended parsing (use invariant culture for consistent number formatting)
+                    // cpu_max_clock uses sustained max (during high load) for better PBO-aware throttle detection
                     Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
                         "{{\"temp\":{0:F2},\"cpu_temp\":{1:F2},\"cpu_clock\":{2},\"cpu_max_clock\":{3},\"cpu_load\":{4:F2},\"gpu_temp\":{5:F2},\"gpu_clock\":{6},\"gpu_max_clock\":{7},\"gpu_load\":{8:F2}}}",
-                        reportedTemp, cpuTemp, (int)avgCpuClock, (int)maxObservedCpuClock, cpuTotalLoad,
-                        gpuTemp, (int)gpuCoreClock, (int)maxObservedGpuClock, gpuCoreLoad));
+                        reportedTemp, cpuTemp, (int)avgCpuClock, (int)cpuMaxForThrottle, cpuTotalLoad,
+                        gpuTemp, (int)gpuCoreClock, (int)gpuMaxForThrottle, gpuCoreLoad));
                 }
             }
         }

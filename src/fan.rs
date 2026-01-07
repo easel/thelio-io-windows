@@ -113,6 +113,9 @@ pub struct ThrottleDetector {
     clock_threshold_pct: f32,
     /// Threshold: load must be above this % to consider throttling
     load_threshold_pct: f32,
+    /// Threshold: temp must be above this to consider THERMAL throttling (hundredths of a degree)
+    /// Below this, clock reduction is likely PBO power limits, not thermal
+    temp_threshold: i16,
     /// Samples needed to confirm throttling
     confirm_samples: u32,
 }
@@ -122,33 +125,40 @@ impl ThrottleDetector {
         Self {
             cpu_throttle_count: 0,
             gpu_throttle_count: 0,
-            clock_threshold_pct: 92.0, // Clock below 92% of max = suspicious (was 85%)
+            clock_threshold_pct: 92.0, // Clock below 92% of max = suspicious
             load_threshold_pct: 70.0,  // Only check when load > 70%
-            confirm_samples: 1,        // React immediately (was 3)
+            temp_threshold: 75_00,     // Only flag thermal throttling if temp > 75°C
+            confirm_samples: 1,        // React immediately
         }
     }
 
-    /// Check if a component is throttling based on clock and load
-    fn check_throttle(&self, clock: u32, max_clock: u32, load: f32) -> bool {
+    /// Check if a component is throttling based on clock, load, and temperature
+    fn check_throttle(&self, clock: u32, max_clock: u32, load: f32, temp: i16) -> bool {
         if max_clock == 0 {
             return false;
         }
         let clock_pct = (clock as f32 / max_clock as f32) * 100.0;
         let is_under_load = load >= self.load_threshold_pct;
         let clock_reduced = clock_pct < self.clock_threshold_pct;
-        is_under_load && clock_reduced
+        let is_hot = temp >= self.temp_threshold;
+
+        // Only flag as thermal throttling if:
+        // 1. Under load (>70%)
+        // 2. Clock is reduced (<92% of sustained max)
+        // 3. Temperature is high (>75°C) - otherwise it's just PBO power limits
+        is_under_load && clock_reduced && is_hot
     }
 
     /// Analyze sensor data and return throttle status (checks both CPU and GPU)
     pub fn analyze(&mut self, data: &SensorData) -> ThrottleStatus {
-        // Check CPU throttling
+        // Check CPU throttling (use CPU temp)
         let cpu_throttling = self.check_throttle(
-            data.cpu_clock, data.cpu_max_clock, data.cpu_load
+            data.cpu_clock, data.cpu_max_clock, data.cpu_load, data.cpu_temp
         );
 
-        // Check GPU throttling
+        // Check GPU throttling (use GPU temp)
         let gpu_throttling = self.check_throttle(
-            data.gpu_clock, data.gpu_max_clock, data.gpu_load
+            data.gpu_clock, data.gpu_max_clock, data.gpu_load, data.gpu_temp
         );
 
         // Update counters

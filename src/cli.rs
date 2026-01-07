@@ -84,7 +84,7 @@ fn cmd_run(curve_name: &str) {
     // Create controller with smoothing and hysteresis
     let mut controller = FanController::new(curve)
         .with_smoothing_window(5)
-        .with_ramp_up_delay(3.0)
+        .with_ramp_up_delay(1.5)   // Faster response (matches service)
         .with_ramp_down_delay(10.0)
         .with_min_duty_change(2_00);
 

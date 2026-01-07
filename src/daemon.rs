@@ -115,7 +115,7 @@ impl DaemonCallback for ConsoleCallback {
     fn on_update(&mut self, output: &FanControllerOutput) {
         if self.first {
             println!("Starting fan control loop (Ctrl+C to stop)");
-            println!("Smoothing: 5s window | Ramp-up: 3s delay | Ramp-down: 10s delay\n");
+            println!("Smoothing: 5s window | Ramp-up: 1.5s delay | Ramp-down: 10s delay\n");
             println!("{:>8} {:>8} {:>8} {:>8} {:>10} {:>6} {:>10} {:>6} {:>14}",
                 "Instant", "Avg", "Target", "Actual", "CPU Clk", "CPU%", "GPU Clk", "GPU%", "State");
             println!("{}", "-".repeat(100));
