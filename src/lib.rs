@@ -77,12 +77,15 @@ impl Io {
         Ok(())
     }
 
-    pub fn tach(&mut self, device: &str) -> Result<u16, String> {
+    pub fn tach(&mut self, device: &str) -> Result<u32, String> {
         if device.len() != 4 {
             return Err(format!("Io tach device length was {} instead of 4", device.len()));
         }
 
-        self.command_u16(&format!("IoTACH{}", device))
+        let raw = self.command_u16(&format!("IoTACH{}", device))?;
+        // Raw tach value must be multiplied by 30 to get RPM
+        // (matches Linux system76-io-dkms driver: system76-io_hwmon.c)
+        Ok(raw as u32 * 30)
     }
 
     pub fn duty(&mut self, device: &str) -> Result<u16, String> {
