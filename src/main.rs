@@ -10,7 +10,7 @@ use std::{
 };
 use thelio_io::{
     daemon,
-    fan::{FanCurve, FanController},
+    fan::{FanConfig, FanCurve, FanController},
 };
 use windows_service::{
     define_windows_service,
@@ -117,61 +117,33 @@ fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
 
     debug!("{} {} detected", sys_vendor, product_version);
 
-    // Read configuration from registry (with defaults)
-    // Values in hundredths: 85°C = 8500, 100% = 10000, 40% = 4000
-    let pbo_temp = read_registry_dword("PboTemp")
-        .map(|v| (v as i16) * 100)
-        .unwrap_or(85_00); // Default 85°C
-
-    let max_fan_duty = read_registry_dword("MaxFanDuty")
-        .map(|v| (v as u16) * 100)
-        .unwrap_or(100_00); // Default 100%
-
-    let silence_threshold = read_registry_dword("SilenceThreshold")
-        .map(|v| (v as u16) * 100)
-        .unwrap_or(40_00); // Default 40%
-
-    let sustained_load_threshold = read_registry_dword("SustainedLoadThreshold")
-        .map(|v| v as f32)
-        .unwrap_or(50.0); // Default 50% CPU
-
-    let cpu_power_threshold = read_registry_dword("CpuPowerThreshold")
-        .map(|v| v as f32)
-        .unwrap_or(95.0); // Default 95W
-
-    let gpu_temp_threshold = read_registry_dword("GpuTempThreshold")
-        .map(|v| (v as i16) * 100)
-        .unwrap_or(70_00); // Default 70°C
-
-    let critical_temp_offset = read_registry_dword("CriticalTempOffset")
-        .map(|v| (v as i16) * 100)
-        .unwrap_or(3_00); // Default +3°C
+    // Build config from defaults, overriding with registry values where present.
+    // Registry values use whole units (e.g., PboTemp=90 for 90°C).
+    let mut config = FanConfig::default();
+    if let Some(v) = read_registry_dword("PboTemp") { config.pbo_temp = (v as i16) * 100; }
+    if let Some(v) = read_registry_dword("MaxFanDuty") { config.max_fan_duty = (v as u16) * 100; }
+    if let Some(v) = read_registry_dword("SilenceThreshold") { config.silence_threshold = (v as u16) * 100; }
+    if let Some(v) = read_registry_dword("SustainedLoadThreshold") { config.sustained_load_threshold = v as f32; }
+    if let Some(v) = read_registry_dword("CpuPowerThreshold") { config.cpu_power_threshold = v as f32; }
+    if let Some(v) = read_registry_dword("GpuTempThreshold") { config.gpu_temp_threshold = (v as i16) * 100; }
+    if let Some(v) = read_registry_dword("CriticalTempOffset") { config.critical_temp_offset = (v as i16) * 100; }
 
     info!(
         "Fan settings: PBO={}°C, MaxFan={}%, Silence={}%, LoadThreshold={}%, PowerThreshold={}W, GpuTempThreshold={}°C, CriticalOffset=+{}°C",
-        pbo_temp / 100, max_fan_duty / 100, silence_threshold / 100, sustained_load_threshold,
-        cpu_power_threshold, gpu_temp_threshold / 100, critical_temp_offset / 100
+        config.pbo_temp / 100, config.max_fan_duty / 100, config.silence_threshold / 100,
+        config.sustained_load_threshold, config.cpu_power_threshold,
+        config.gpu_temp_threshold / 100, config.critical_temp_offset / 100
     );
 
-    // Create PBO-based fan curve
-    let curve = FanCurve::pbo_curve(pbo_temp, max_fan_duty, silence_threshold);
+    // Create PBO-based fan curve from config
+    let curve = FanCurve::pbo_curve(config.pbo_temp, config.max_fan_duty, config.silence_threshold);
 
     // Find Thelio Io devices
     let mut ios = daemon::find_thelio_io_devices()?;
     debug!("Found {} Thelio Io device(s)", ios.len());
 
-    // Create fan controller with PBO-based settings
-    let mut controller = FanController::new(curve)
-        .with_smoothing_window(5)
-        .with_ramp_down_delay(10.0)
-        .with_min_duty_change(2_00)
-        .with_pbo_temp(pbo_temp)
-        .with_max_fan_duty(max_fan_duty)
-        .with_silence_threshold(silence_threshold)
-        .with_sustained_load_threshold(sustained_load_threshold)
-        .with_cpu_power_threshold(cpu_power_threshold)
-        .with_gpu_temp_threshold(gpu_temp_threshold)
-        .with_critical_temp_offset(critical_temp_offset);
+    // Create fan controller from config
+    let mut controller = FanController::from_config(curve, &config);
 
     debug!("Fan controller initialized with PBO-based curve");
 

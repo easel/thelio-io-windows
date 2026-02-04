@@ -4,6 +4,41 @@
 use std::collections::VecDeque;
 use std::time::Instant;
 
+/// Fan controller configuration — all tunables in one place.
+///
+/// Defaults are defined in the `Default` impl. In service mode, values
+/// are overridden from the Windows registry (`HKLM\SOFTWARE\ThelioIo`).
+pub struct FanConfig {
+    /// PBO temperature limit (hundredths of a degree, e.g., 90_00 = 90°C)
+    pub pbo_temp: i16,
+    /// Maximum fan duty (hundredths of a percent, e.g., 100_00 = 100%)
+    pub max_fan_duty: u16,
+    /// Silence threshold — fans inaudible below this (hundredths of percent)
+    pub silence_threshold: u16,
+    /// CPU load threshold for sustained load detection (0-100)
+    pub sustained_load_threshold: f32,
+    /// CPU power threshold for secondary fan trigger (watts)
+    pub cpu_power_threshold: f32,
+    /// GPU temp threshold for secondary fan trigger (hundredths)
+    pub gpu_temp_threshold: i16,
+    /// Critical temp offset above PBO (hundredths, e.g., 3_00 = +3°C)
+    pub critical_temp_offset: i16,
+}
+
+impl Default for FanConfig {
+    fn default() -> Self {
+        Self {
+            pbo_temp: 90_00,                // 90°C (Ryzen 5950X TjMax)
+            max_fan_duty: 100_00,           // 100%
+            silence_threshold: 40_00,       // 40%
+            sustained_load_threshold: 50.0, // 50% CPU
+            cpu_power_threshold: 95.0,      // 95W
+            gpu_temp_threshold: 70_00,      // 70°C
+            critical_temp_offset: 3_00,     // +3°C
+        }
+    }
+}
+
 /// Thermal throttling status
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ThrottleStatus {
@@ -275,22 +310,33 @@ impl FanCurve {
         self
     }
 
-    /// The standard fan curve optimized for PBO @ 85°C
-    /// - 40-60°C: 0% → 40% (ramp to near-silent, 40% is almost silent)
-    /// - 60-75°C: 40% → 60% (slow ramp, still quiet)
-    /// - 75-85°C: 60% → 100% (smooth ramp to aggressive)
-    pub fn standard() -> Self {
-        Self::default()
-            .append(40_00, 0_00)    // 0% at 40°C
-            .append(60_00, 40_00)   // 40% at 60°C (near-silent)
-            .append(65_00, 47_00)   // 47% at 65°C
-            .append(70_00, 53_00)   // 53% at 70°C
-            .append(75_00, 60_00)   // 60% at 75°C (start aggressive ramp)
-            .append(78_00, 72_00)   // 72% at 78°C
-            .append(80_00, 80_00)   // 80% at 80°C
-            .append(82_00, 88_00)   // 88% at 82°C
-            .append(84_00, 95_00)   // 95% at 84°C
-            .append(85_00, 100_00)  // 100% at 85°C (matches PBO limit)
+    /// Standard fan curve — breakpoints computed from pbo_temp.
+    /// Gentle ramp from silence (40%) at 60°C to 100% at pbo_temp.
+    pub fn standard(pbo_temp: i16) -> Self {
+        let ramp_start = 60_00i16;
+        let range = (pbo_temp - ramp_start) as f32;
+
+        // Shape: (fraction of ramp range, duty in hundredths)
+        // Gentle for the first 60%, aggressive for the last 40%
+        let shape: &[(f32, u16)] = &[
+            (0.20, 47_00),
+            (0.40, 53_00),
+            (0.60, 60_00),
+            (0.72, 72_00),
+            (0.80, 80_00),
+            (0.88, 88_00),
+            (0.96, 95_00),
+        ];
+
+        let mut curve = Self::default()
+            .append(40_00, 0_00)
+            .append(ramp_start, 40_00);
+
+        for &(frac, duty) in shape {
+            curve = curve.append(ramp_start + (frac * range) as i16, duty);
+        }
+
+        curve.append(pbo_temp, 100_00)
     }
 
     /// Fan curve for threadripper 2
@@ -333,19 +379,33 @@ impl FanCurve {
             .append(78_00, 100_00)
     }
 
-    /// Quiet fan curve - keeps fans off longer, ramps up more gradually
-    pub fn quiet() -> Self {
-        Self::default()
-            .append(54_99, 0_00)    // Fans off until 55°C (was 45°C)
-            .append(55_00, 25_00)   // Start at 25% (was 30%)
-            .append(65_00, 30_00)   // Gradual ramp
-            .append(75_00, 40_00)   // 40% at 75°C (was 50%)
-            .append(80_00, 50_00)   // 50% at 80°C
-            .append(83_00, 60_00)   // 60% at 83°C
-            .append(86_00, 70_00)   // 70% at 86°C
-            .append(89_00, 80_00)   // 80% at 89°C
-            .append(92_00, 90_00)   // 90% at 92°C
-            .append(95_00, 100_00)  // 100% only at 95°C
+    /// Quiet fan curve — breakpoints computed from pbo_temp.
+    /// Fans stay off until 55°C, then ramp gently to 100% at pbo_temp.
+    pub fn quiet(pbo_temp: i16) -> Self {
+        let ramp_start = 55_00i16;
+        let range = (pbo_temp - ramp_start) as f32;
+
+        // Shape: (fraction of ramp range, duty in hundredths)
+        // Much gentler than standard — prioritizes low noise
+        let shape: &[(f32, u16)] = &[
+            (0.00, 25_00),
+            (0.25, 30_00),
+            (0.50, 40_00),
+            (0.625, 50_00),
+            (0.70, 60_00),
+            (0.78, 70_00),
+            (0.85, 80_00),
+            (0.93, 90_00),
+        ];
+
+        let mut curve = Self::default()
+            .append(ramp_start - 1, 0_00);
+
+        for &(frac, duty) in shape {
+            curve = curve.append(ramp_start + (frac * range) as i16, duty);
+        }
+
+        curve.append(pbo_temp, 100_00)
     }
 
     /// PBO-based fan curve with configurable parameters.
@@ -415,7 +475,7 @@ pub struct FanController {
     ramp_down_delay_secs: f32,
     /// Minimum duty change to act on (prevents micro-adjustments)
     min_duty_change: u16,
-    /// PBO temperature limit (hundredths of a degree, e.g., 85_00 = 85°C)
+    /// PBO temperature limit (hundredths of a degree, e.g., 90_00 = 90°C)
     pbo_temp: i16,
     /// Maximum fan duty (hundredths of a percent, e.g., 100_00 = 100%)
     max_fan_duty: u16,
@@ -434,20 +494,13 @@ pub struct FanController {
 }
 
 impl FanController {
-    /// Create a new fan controller with default PBO-based settings.
-    ///
-    /// Defaults:
-    /// - 5 second temperature smoothing window
-    /// - 10 second ramp-down delay
-    /// - 200 (2%) minimum duty change
-    /// - PBO temp: 85°C
-    /// - Max fan duty: 100%
-    /// - Silence threshold: 40%
-    /// - Sustained load threshold: 50% CPU
-    /// - CPU power threshold: 95W
-    /// - GPU temp threshold: 70°C
-    /// - Critical temp offset: +3°C
+    /// Create a new fan controller with defaults from `FanConfig::default()`.
     pub fn new(curve: FanCurve) -> Self {
+        Self::from_config(curve, &FanConfig::default())
+    }
+
+    /// Create a fan controller from explicit configuration.
+    pub fn from_config(curve: FanCurve, config: &FanConfig) -> Self {
         Self {
             curve,
             temp_history: VecDeque::with_capacity(10),
@@ -455,15 +508,15 @@ impl FanController {
             current_duty: 0,
             last_decrease: None,
             ramp_down_delay_secs: 10.0,
-            min_duty_change: 2_00, // 2%
-            pbo_temp: 85_00,       // 85°C
-            max_fan_duty: 100_00,  // 100%
-            silence_threshold: 40_00, // 40%
+            min_duty_change: 2_00,
+            pbo_temp: config.pbo_temp,
+            max_fan_duty: config.max_fan_duty,
+            silence_threshold: config.silence_threshold,
             sustained_load_start: None,
-            sustained_load_threshold: 50.0, // 50% CPU
-            cpu_power_threshold: 95.0,      // 95W
-            gpu_temp_threshold: 70_00,      // 70°C
-            critical_temp_offset: 3_00,     // +3°C
+            sustained_load_threshold: config.sustained_load_threshold,
+            cpu_power_threshold: config.cpu_power_threshold,
+            gpu_temp_threshold: config.gpu_temp_threshold,
+            critical_temp_offset: config.critical_temp_offset,
         }
     }
 
@@ -758,7 +811,8 @@ mod tests {
 
     #[test]
     fn test_fan_curve_standard_interpolation() {
-        let curve = FanCurve::standard();
+        let pbo_temp = 90_00i16;
+        let curve = FanCurve::standard(pbo_temp);
 
         // Below first point - should return first duty
         assert_eq!(curve.get_duty(30_00), Some(0));
@@ -766,20 +820,20 @@ mod tests {
         // At exact points
         assert_eq!(curve.get_duty(40_00), Some(0));       // 0% at 40°C
         assert_eq!(curve.get_duty(60_00), Some(40_00));   // 40% at 60°C
-        assert_eq!(curve.get_duty(75_00), Some(60_00));   // 60% at 75°C
-        assert_eq!(curve.get_duty(85_00), Some(100_00));  // 100% at 85°C
+        assert_eq!(curve.get_duty(pbo_temp), Some(100_00)); // 100% at PBO temp
 
         // Above last point
         assert_eq!(curve.get_duty(95_00), Some(100_00));
 
-        // Interpolated value between 60C (40%) and 65C (47%)
+        // Interpolated value between 60C (40%) and first shape point
         let duty_at_62 = curve.get_duty(62_00).unwrap();
-        assert!(duty_at_62 > 40_00 && duty_at_62 < 47_00);
+        assert!(duty_at_62 > 40_00 && duty_at_62 < 50_00);
     }
 
     #[test]
     fn test_fan_curve_quiet() {
-        let curve = FanCurve::quiet();
+        let pbo_temp = 90_00i16;
+        let curve = FanCurve::quiet(pbo_temp);
 
         // Fans off below 55C
         assert_eq!(curve.get_duty(50_00), Some(0));
@@ -787,6 +841,9 @@ mod tests {
 
         // Starts at 55C
         assert_eq!(curve.get_duty(55_00), Some(25_00));
+
+        // At PBO temp = 100%
+        assert_eq!(curve.get_duty(pbo_temp), Some(100_00));
     }
 
     #[test]

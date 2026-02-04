@@ -7,7 +7,7 @@ use std::thread::sleep;
 
 use thelio_io::{
     Io,
-    fan::{FanCurve, FanController},
+    fan::{FanConfig, FanCurve, FanController},
     daemon::{self, ConsoleCallback, FAN_DEVICES},
 };
 
@@ -54,27 +54,21 @@ fn cmd_status() {
 }
 
 fn cmd_run(curve_name: &str) {
-    // Default PBO settings (can be overridden by legacy curves)
-    let pbo_temp = 85_00i16;
-    let max_fan_duty = 100_00u16;
-    let silence_threshold = 40_00u16;
-    let sustained_load_threshold = 50.0f32;
-    let cpu_power_threshold = 95.0f32;
-    let gpu_temp_threshold = 70_00i16;
-    let critical_temp_offset = 3_00i16;
+    let config = FanConfig::default();
 
     let curve = match curve_name {
         "pbo" => {
-            println!("Using PBO-based fan curve (PBO=85°C, Max=100%, Silence=40%)");
-            FanCurve::pbo_curve(pbo_temp, max_fan_duty, silence_threshold)
+            println!("Using PBO-based fan curve (PBO={}°C, Max={}%, Silence={}%)",
+                config.pbo_temp / 100, config.max_fan_duty / 100, config.silence_threshold / 100);
+            FanCurve::pbo_curve(config.pbo_temp, config.max_fan_duty, config.silence_threshold)
         }
         "standard" => {
-            println!("Using STANDARD fan curve");
-            FanCurve::standard()
+            println!("Using STANDARD fan curve (PBO={}°C)", config.pbo_temp / 100);
+            FanCurve::standard(config.pbo_temp)
         }
         "quiet" => {
-            println!("Using QUIET fan curve");
-            FanCurve::quiet()
+            println!("Using QUIET fan curve (PBO={}°C)", config.pbo_temp / 100);
+            FanCurve::quiet(config.pbo_temp)
         }
         "threadripper2" => {
             println!("Using THREADRIPPER2 fan curve");
@@ -94,18 +88,8 @@ fn cmd_run(curve_name: &str) {
         }
     };
 
-    // Create controller with PBO-based settings
-    let mut controller = FanController::new(curve)
-        .with_smoothing_window(5)
-        .with_ramp_down_delay(10.0)
-        .with_min_duty_change(2_00)
-        .with_pbo_temp(pbo_temp)
-        .with_max_fan_duty(max_fan_duty)
-        .with_silence_threshold(silence_threshold)
-        .with_sustained_load_threshold(sustained_load_threshold)
-        .with_cpu_power_threshold(cpu_power_threshold)
-        .with_gpu_temp_threshold(gpu_temp_threshold)
-        .with_critical_temp_offset(critical_temp_offset);
+    // Create controller from config
+    let mut controller = FanController::from_config(curve, &config);
 
     // Find Thelio Io devices
     let mut ios = match daemon::find_thelio_io_devices() {
@@ -227,11 +211,11 @@ fn cmd_temps() {
 
 fn cmd_curves() {
     println!("Available fan curves:\n");
-    println!("STANDARD (default) - optimized for PBO @ 85C:");
-    println!("  40C->0%  60C->40%  75C->60%  80C->80%  85C->100%");
+    println!("STANDARD (default) - computed from PBO temp (default 90C):");
+    println!("  40C->0%  60C->40%  ...ramp...  PBO->100%");
     println!();
-    println!("QUIET:");
-    println!("  55C->25%  65C->30%  75C->40%  80C->50%  83C->60%  86C->70%  89C->80%  92C->90%  95C->100%");
+    println!("QUIET - computed from PBO temp (default 90C):");
+    println!("  55C->25%  ...gentle ramp...  PBO->100%");
     println!();
     println!("THREADRIPPER2:");
     println!("  0C->30%  40C->40%  47.5C->50%  55C->65%  62.5C->85%  66.25C->100%");
