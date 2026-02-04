@@ -34,6 +34,7 @@ namespace wrapper
 
                 float? cpuPackageTemp = null;  // Intel: "CPU Package" or AMD: "Core (Tctl/Tdie)"
                 float? cpuCoreMax = null;     // "Core Max" - hottest core
+                float? cpuCcdMax = null;      // AMD: "CPU CCD Max" - hottest CCD (what PBO targets)
                 float? cpuCcdAvg = null;      // AMD Zen 2/3: pre-calculated CCD average
                 var cpuCoreTemps = new List<float>();  // Individual core temps
                 var cpuCcdTemps = new List<float>();   // AMD: individual CCD temps
@@ -74,8 +75,14 @@ namespace wrapper
                                 else if (s.Name == "Core Max") {
                                     cpuCoreMax = v;
                                 }
-                                // AMD Zen 2/3: pre-calculated CCD average
-                                else if (s.Name == "CPU CCD Average") {
+                                // AMD: hottest CCD - this is what PBO actually targets
+                                // LHM names vary: "CPU CCD Max", "CCDs Max (Tdie)"
+                                else if (s.Name == "CPU CCD Max" || s.Name == "CCDs Max (Tdie)") {
+                                    cpuCcdMax = v;
+                                }
+                                // AMD: pre-calculated CCD average
+                                // LHM names vary: "CPU CCD Average", "CCDs Average (Tdie)"
+                                else if (s.Name == "CPU CCD Average" || s.Name == "CCDs Average (Tdie)") {
                                     cpuCcdAvg = v;
                                 }
                                 // Individual core temps (Intel: "Core #0", "Core #1", etc.)
@@ -83,12 +90,17 @@ namespace wrapper
                                     cpuCoreTemps.Add(v);
                                 }
                                 // AMD: individual CCD temps
-                                else if (s.Name.StartsWith("CPU CCD #")) {
+                                // LHM names vary: "CPU CCD #1" or "CCD1 (Tdie)"
+                                else if (s.Name.StartsWith("CPU CCD #") ||
+                                         (s.Name.StartsWith("CCD") && s.Name.Length > 3 && char.IsDigit(s.Name[3]))) {
                                     cpuCcdTemps.Add(v);
                                 }
                             }
                             // Clock sensors - collect per-core clocks
-                            else if (s.SensorType == SensorType.Clock && s.Name.StartsWith("CPU Core #")) {
+                            // LHM names vary: "CPU Core #1" or "Core #1" (exclude "Effective" variants)
+                            else if (s.SensorType == SensorType.Clock &&
+                                     (s.Name.StartsWith("CPU Core #") ||
+                                      (s.Name.StartsWith("Core #") && !s.Name.Contains("Effective")))) {
                                 var v = s.Value ?? 0;
                                 if (v > 0) cpuClocks.Add(v);
                             }
@@ -97,7 +109,8 @@ namespace wrapper
                                 cpuTotalLoad = s.Value ?? 0;
                             }
                             // CPU package power for secondary fan trigger
-                            else if (s.SensorType == SensorType.Power && s.Name == "CPU Package") {
+                            // LHM names vary: "CPU Package" or "Package"
+                            else if (s.SensorType == SensorType.Power && (s.Name == "CPU Package" || s.Name == "Package")) {
                                 cpuPackagePower = s.Value ?? 0;
                             }
                         }
@@ -121,24 +134,25 @@ namespace wrapper
                     }
                 }
 
-                // Select CPU temp with priority - Package temp is most stable for fan control
-                // Priority: Package/Tctl > CCD Average > average of cores/CCDs
-                // (Core Max spikes too much and causes fan oscillation)
+                // Select CPU temp with priority
+                // AMD: prefer CCD Max — this is the actual die temp PBO targets.
+                // CPU Package/Tctl reads 2-3°C higher due to IOD thermal contribution,
+                // which causes the fan curve to overshoot relative to PBO's thermal limit.
+                // Intel: fall back to CPU Package (no CCD sensors available).
                 float cpuTemp = 0;
-                if (cpuPackageTemp.HasValue) {
+                if (cpuCcdMax.HasValue) {
+                    cpuTemp = cpuCcdMax.Value;
+                    cpuTempSource = "CCD Max";
+                } else if (cpuCcdTemps.Count > 0) {
+                    cpuTemp = cpuCcdTemps.Max();
+                    cpuTempSource = $"Max of {cpuCcdTemps.Count} CCDs";
+                } else if (cpuPackageTemp.HasValue) {
                     cpuTemp = cpuPackageTemp.Value;
                     cpuTempSource = "CPU Package";
-                } else if (cpuCcdAvg.HasValue) {
-                    cpuTemp = cpuCcdAvg.Value;
-                    cpuTempSource = "CCD Average";
                 } else if (cpuCoreTemps.Count > 0) {
                     cpuTemp = cpuCoreTemps.Average();
                     cpuTempSource = $"Avg of {cpuCoreTemps.Count} cores";
-                } else if (cpuCcdTemps.Count > 0) {
-                    cpuTemp = cpuCcdTemps.Average();
-                    cpuTempSource = $"Avg of {cpuCcdTemps.Count} CCDs";
                 } else if (cpuCoreMax.HasValue) {
-                    // Last resort fallback
                     cpuTemp = cpuCoreMax.Value;
                     cpuTempSource = "Core Max (fallback)";
                 }
@@ -172,7 +186,7 @@ namespace wrapper
 
                 if (debugMode) {
                     Console.WriteLine($"CPU temp: {cpuTemp:F1}C (from {cpuTempSource})");
-                    Console.WriteLine($"  Package: {cpuPackageTemp?.ToString("F1") ?? "N/A"}C, Core Max: {cpuCoreMax?.ToString("F1") ?? "N/A"}C, CCD Avg: {cpuCcdAvg?.ToString("F1") ?? "N/A"}C");
+                    Console.WriteLine($"  Package: {cpuPackageTemp?.ToString("F1") ?? "N/A"}C, CCD Max: {cpuCcdMax?.ToString("F1") ?? "N/A"}C, Core Max: {cpuCoreMax?.ToString("F1") ?? "N/A"}C, CCD Avg: {cpuCcdAvg?.ToString("F1") ?? "N/A"}C");
                     Console.WriteLine($"  Core temps: [{string.Join(", ", cpuCoreTemps.Select(t => $"{t:F1}"))}]");
                     Console.WriteLine($"CPU clock: {avgCpuClock:F0} MHz (sustained max: {maxSustainedCpuClock:F0}, burst max: {maxBurstCpuClock:F0})");
                     Console.WriteLine($"CPU load: {cpuTotalLoad:F1}%");
