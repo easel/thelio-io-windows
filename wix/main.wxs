@@ -30,7 +30,7 @@
                             Description="System76 Thelio Io Fan Controller"
                             Manufacturer="System76" />
 
-        <MajorUpgrade Schedule="afterInstallInitialize"
+        <MajorUpgrade Schedule="afterInstallValidate"
                       AllowSameVersionUpgrades="yes"
                       DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit." />
 

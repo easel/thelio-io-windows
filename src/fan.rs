@@ -32,7 +32,7 @@ impl Default for FanConfig {
             max_fan_duty: 100_00,           // 100%
             silence_threshold: 40_00,       // 40%
             sustained_load_threshold: 50.0, // 50% CPU
-            cpu_power_threshold: 95.0,      // 95W
+            cpu_power_threshold: 125.0,     // 125W (5950X PPT is 142W)
             gpu_temp_threshold: 70_00,      // 70°C
             critical_temp_offset: 3_00,     // +3°C
         }
