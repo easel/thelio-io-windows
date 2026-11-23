@@ -161,6 +161,14 @@ Service logs are available in Event Viewer:
 └─────────────────┘
 ```
 
+## Linux
+
+The same controller is ported to Linux for Thelio Mira as a patch to
+`system76-power`: see
+[easel/system76-power](https://github.com/easel/system76-power/tree/thelio-mira-pbo-fan-controller)
+(branch `thelio-mira-pbo-fan-controller`). It uses the same curve, smoothing, quiet floor and
+sustained-demand ramp, except for the CPU package power trigger.
+
 ## License
 
 GPL-3.0 - See [LICENSE.md](LICENSE.md)
