@@ -1,28 +1,16 @@
-use log::{
-    debug,
-    error,
-};
+use log::{debug, error, info};
 use std::{
-    env::current_exe,
     ffi::OsString,
-    io::{
-        self,
-        BufRead,
-        BufReader,
-        Write,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
     },
-    process::{
-        Child,
-        Command,
-        Stdio,
-        exit,
-    },
-    thread::sleep,
     time::Duration,
 };
 use thelio_io::{
-    fan::FanCurve,
-    Io,
+    daemon,
+    fan::{FanConfig, FanCurve, FanController},
 };
 use windows_service::{
     define_windows_service,
@@ -34,167 +22,203 @@ use windows_service::{
         ServiceStatus,
         ServiceType,
     },
+    service_control_handler::{self, ServiceControlHandlerResult},
     service_dispatcher,
-    service_control_handler::{
-        self,
-        ServiceControlHandlerResult,
-    },
 };
+use winreg::enums::*;
+use winreg::RegKey;
 
-fn driver_loop(curve: &FanCurve, ios: &mut [Io], wrapper: &mut Child) -> io::Result<()> {
-    let mut wrapper_in = wrapper.stdin.take().unwrap();
-    let mut wrapper_out = BufReader::new(wrapper.stdout.take().unwrap());
+/// Registry key for fan controller settings
+const REGISTRY_KEY: &str = r"SOFTWARE\ThelioIo";
 
-    loop {
-        wrapper_in.write_all(b"\n")?;
-        let mut line = String::new();
-        wrapper_out.read_line(&mut line)?;
+/// Read a DWORD value from registry, returning None if not found
+fn read_registry_dword(name: &str) -> Option<u32> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = hklm.open_subkey(REGISTRY_KEY).ok()?;
+    key.get_value::<u32, _>(name).ok()
+}
 
-        let temp = line.trim().parse::<f64>().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                err
-            )
-        })?;
+/// Logging callback for service mode
+struct LogCallback {
+    /// Track previous sustained load state to avoid spamming logs
+    was_sustained: bool,
+}
 
-        if let Some(duty) = curve.get_duty((temp * 100.0) as i16) {
-            for io in ios.iter_mut() {
-                for device in &["CPUF", "INTF"] {
-                    io.set_duty(device, duty).map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::Other,
-                            err
-                        )
-                    })?;
-                }
-            }
+impl LogCallback {
+    fn new() -> Self {
+        Self {
+            was_sustained: false,
         }
-
-        sleep(Duration::new(1, 0));
     }
 }
 
-fn driver() -> io::Result<()> {
+impl daemon::DaemonCallback for LogCallback {
+    fn on_update(&mut self, output: &thelio_io::fan::FanControllerOutput) {
+        // Log fan duty changes
+        if output.duty_changed {
+            debug!(
+                "Fan duty change: {:.1}C (avg {:.1}C) -> {:.1}% ({}) [CPU: {:.1}%, GPU: {:.1}%]",
+                output.instant_temp as f32 / 100.0,
+                output.smoothed_temp as f32 / 100.0,
+                output.actual_duty as f32 / 100.0,
+                output.reason,
+                output.cpu_load,
+                output.gpu_load,
+            );
+        }
+
+        // Log sustained load state changes
+        if output.sustained_load != self.was_sustained {
+            if output.sustained_load {
+                info!(
+                    "Sustained load detected at {:.1}C, CPU {:.1}% - beginning gradual ramp",
+                    output.smoothed_temp as f32 / 100.0,
+                    output.cpu_load,
+                );
+            } else if self.was_sustained {
+                info!("Sustained load ended - holding duty at {:.1}%",
+                    output.actual_duty as f32 / 100.0);
+            }
+            self.was_sustained = output.sustained_load;
+        }
+    }
+}
+
+fn driver(stop_flag: Arc<AtomicBool>) -> io::Result<()> {
     let smbios = smbioslib::table_load_from_device()?;
 
-    let sys_vendor = smbios.find_map(
-        |sys: smbioslib::SMBiosSystemInformation| sys.manufacturer()
-    ).unwrap_or(String::new());
+    let sys_vendor = smbios
+        .find_map(|sys: smbioslib::SMBiosSystemInformation| sys.manufacturer())
+        .unwrap_or_default();
 
-    let product_version = smbios.find_map(
-        |sys: smbioslib::SMBiosSystemInformation| sys.version()
-    ).unwrap_or(String::new());
+    let product_version = smbios
+        .find_map(|sys: smbioslib::SMBiosSystemInformation| sys.version())
+        .unwrap_or_default();
 
-    let curve = match (sys_vendor.as_str(), product_version.as_str()) {
+    // Validate this is a supported Thelio system
+    let is_supported = matches!(
+        (sys_vendor.as_str(), product_version.as_str()),
         ("System76", "thelio-mira-r1" | "thelio-mira-r2" | "thelio-mira-r3"
-                   | "thelio-mira-b1" | "thelio-mira-b2" | "thelio-mira-b3" | "thelio-mira-b4") => {
-            debug!("{} {} uses standard fan curve", sys_vendor, product_version);
-            FanCurve::standard()
-        },
-        ("System76", "thelio-major-r1") => {
-            debug!("{} {} uses threadripper2 fan curve", sys_vendor, product_version);
-            FanCurve::threadripper2()
-        },
-        ("System76", "thelio-major-r2" | "thelio-major-r2.1" | "thelio-major-b1" | "thelio-major-b2"
-                   | "thelio-major-b3" | "thelio-mega-r1" | "thelio-mega-r1.1" ) => {
-            debug!("{} {} uses hedt fan curve", sys_vendor, product_version);
-            FanCurve::hedt()
-        },
-        ("System76", "thelio-massive-b1") => {
-            debug!("{} {} uses xeon fan curve", sys_vendor, product_version);
-            FanCurve::xeon()
-        },
-        _ => return Err(io::Error::new(
+                   | "thelio-mira-b1" | "thelio-mira-b2" | "thelio-mira-b3" | "thelio-mira-b4"
+                   | "thelio-major-r1" | "thelio-major-r2" | "thelio-major-r2.1"
+                   | "thelio-major-b1" | "thelio-major-b2" | "thelio-major-b3"
+                   | "thelio-mega-r1" | "thelio-mega-r1.1" | "thelio-massive-b1")
+    );
+
+    if !is_supported {
+        return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
                 "unsupported sys_vendor '{}' and product_version '{}'",
-                sys_vendor,
-                product_version
-            )
-        )),
-    };
-
-    let mut ios = Vec::new();
-    for port_info in serialport::available_ports()? {
-        match port_info.port_type {
-            serialport::SerialPortType::UsbPort(usb_info) => {
-                if usb_info.vid == 0x1209 && usb_info.pid == 0x1776 {
-                    debug!("Thelio Io at {}", port_info.port_name);
-
-                    let port = serialport::new(port_info.port_name, 115200)
-                        .timeout(Duration::from_millis(1))
-                        .open()?;
-
-                    let mut io = Io::new(port, 1000);
-                    io.reset().map_err(|err| io::Error::new(
-                        io::ErrorKind::Other,
-                        err
-                    ))?;
-                    ios.push(io);
-                }
-            },
-            _ => (),
-        }
-    }
-
-    if ios.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "failed to find any Thelio Io devices"
+                sys_vendor, product_version
+            ),
         ));
     }
 
-    let bin_path = current_exe()?;
-    let bin_dir = bin_path.parent().unwrap();
-    let wrapper_path = bin_dir.join("thelio-io_wrapper.exe");
-    let mut wrapper = Command::new(&wrapper_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
+    debug!("{} {} detected", sys_vendor, product_version);
 
-    let res = driver_loop(&curve, &mut ios, &mut wrapper);
+    // Build config from defaults, overriding with registry values where present.
+    // Registry values use whole units (e.g., PboTemp=90 for 90°C).
+    let mut config = FanConfig::default();
+    if let Some(v) = read_registry_dword("PboTemp") { config.pbo_temp = (v as i16) * 100; }
+    if let Some(v) = read_registry_dword("MaxFanDuty") { config.max_fan_duty = (v as u16) * 100; }
+    if let Some(v) = read_registry_dword("SilenceThreshold") { config.silence_threshold = (v as u16) * 100; }
+    if let Some(v) = read_registry_dword("SustainedLoadThreshold") { config.sustained_load_threshold = v as f32; }
+    if let Some(v) = read_registry_dword("CpuPowerThreshold") { config.cpu_power_threshold = v as f32; }
+    if let Some(v) = read_registry_dword("GpuTempThreshold") { config.gpu_temp_threshold = (v as i16) * 100; }
+    if let Some(v) = read_registry_dword("CriticalTempOffset") { config.critical_temp_offset = (v as i16) * 100; }
+
+    info!(
+        "Fan settings: PBO={}°C, MaxFan={}%, Silence={}%, LoadThreshold={}%, PowerThreshold={}W, GpuTempThreshold={}°C, CriticalOffset=+{}°C",
+        config.pbo_temp / 100, config.max_fan_duty / 100, config.silence_threshold / 100,
+        config.sustained_load_threshold, config.cpu_power_threshold,
+        config.gpu_temp_threshold / 100, config.critical_temp_offset / 100
+    );
+
+    // Create PBO-based fan curve from config
+    let curve = FanCurve::pbo_curve(config.pbo_temp, config.max_fan_duty, config.silence_threshold);
+
+    // Find Thelio Io devices
+    let mut ios = daemon::find_thelio_io_devices()?;
+    debug!("Found {} Thelio Io device(s)", ios.len());
+
+    // Create fan controller from config
+    let mut controller = FanController::from_config(curve, &config);
+
+    debug!("Fan controller initialized with PBO-based curve");
+
+    // Launch wrapper
+    let mut wrapper = daemon::launch_wrapper()?;
+
+    // Run the daemon loop
+    let mut callback = LogCallback::new();
+    let res = daemon::run_daemon(&mut controller, &mut ios, &mut wrapper, &stop_flag, &mut callback);
 
     let _ = wrapper.kill();
+
+    if res.is_ok() {
+        info!("Stop signal received, shutting down");
+    }
 
     res
 }
 
 fn service_main(_args: Vec<OsString>) {
-    // Windows event log
     winlog::init("System76 Thelio Io").expect("failed to initialize logging");
 
-    // Handle service events
-    let status_handle = service_control_handler::register("thelio-io", |event| -> ServiceControlHandlerResult {
-        //TODO: handle stop event
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_clone = Arc::clone(&stop_flag);
+
+    let status_handle = service_control_handler::register("thelio-io", move |event| -> ServiceControlHandlerResult {
         match event {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop => {
+                info!("Service stop requested");
+                stop_flag_clone.store(true, Ordering::Relaxed);
+                ServiceControlHandlerResult::NoError
+            }
             _ => ServiceControlHandlerResult::NotImplemented,
         }
-    }).expect("failed to register for service events");
+    })
+    .expect("failed to register for service events");
 
-    // Update service status
-    status_handle.set_service_status(ServiceStatus {
+    status_handle
+        .set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })
+        .expect("failed to set service status");
+
+    let exit_code = match driver(stop_flag) {
+        Ok(()) => {
+            info!("Service stopped cleanly");
+            ServiceExitCode::Win32(0)
+        }
+        Err(err) => {
+            error!("{}\n{:#?}", err, err);
+            ServiceExitCode::Win32(1)
+        }
+    };
+
+    let _ = status_handle.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
+        current_state: ServiceState::Stopped,
         controls_accepted: ServiceControlAccept::empty(),
-        exit_code: ServiceExitCode::Win32(0),
+        exit_code,
         checkpoint: 0,
         wait_hint: Duration::default(),
         process_id: None,
-    }).expect("failed to set service status");
-
-    // Run driver
-    if let Err(err) = driver() {
-        error!("{}\n{:#?}", err, err);
-        //TODO: set service status
-        exit(1);
-    }
+    });
 }
 
 define_windows_service!(ffi_service_main, service_main);
 
 fn main() -> Result<(), windows_service::Error> {
-    // Dispatch service
     service_dispatcher::start("thelio-io", ffi_service_main)?;
     Ok(())
 }

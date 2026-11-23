@@ -1,5 +1,8 @@
 ﻿using System;
-using OpenHardwareMonitor.Hardware;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Linq;
+using LibreHardwareMonitor.Hardware;
 
 namespace wrapper
 {
@@ -7,30 +10,199 @@ namespace wrapper
     {
         static void Main(string[] args)
         {
-            var c = new Computer();
-            c.CPUEnabled = true;
-            c.GPUEnabled = true;
+            bool debugMode = args.Length > 0 && args[0] == "--debug";
+
+            var c = new Computer
+            {
+                IsCpuEnabled = true,
+                IsGpuEnabled = true
+            };
             c.Open();
 
-            while (true) {
-                //TODO: support some commands if necessary
-                Console.ReadLine();
+            // Track max observed clocks for throttle detection
+            // "Sustained" max = max seen during high load (>80%), better for PBO detection
+            // "Burst" max = max ever seen (includes single-core boost)
+            float maxSustainedCpuClock = 0;
+            float maxSustainedGpuClock = 0;
+            float maxBurstCpuClock = 0;
+            float maxBurstGpuClock = 0;
 
-                var max = 0.0F;
+            while (true) {
+                // Wait for input - exits if stdin closes
+                var line = Console.ReadLine();
+                if (line == null) break;
+
+                float? cpuPackageTemp = null;  // Intel: "CPU Package" or AMD: "Core (Tctl/Tdie)"
+                float? cpuCoreMax = null;     // "Core Max" - hottest core
+                float? cpuCcdMax = null;      // AMD: "CPU CCD Max" - hottest CCD (what PBO targets)
+                float? cpuCcdAvg = null;      // AMD Zen 2/3: pre-calculated CCD average
+                var cpuCoreTemps = new List<float>();  // Individual core temps
+                var cpuCcdTemps = new List<float>();   // AMD: individual CCD temps
+                float gpuTemp = 0;
+                string gpuTempSource = "";
+                string cpuTempSource = "";
+
+                // CPU clock and load tracking for throttle detection
+                var cpuClocks = new List<float>();
+                float cpuTotalLoad = 0;
+
+                // GPU clock and load tracking for throttle detection
+                float gpuCoreClock = 0;
+                float gpuCoreLoad = 0;
+
+                // CPU power tracking for secondary fan trigger
+                float cpuPackagePower = 0;
+
                 foreach (var h in c.Hardware) {
                     h.Update();
                     foreach (var s in h.Sensors) {
-                        if (s.SensorType == SensorType.Temperature) {
+                        if (debugMode) {
                             var v = s.Value ?? 0;
-                            //Console.WriteLine($"{s.Identifier} {s.Index} {s.Name} {v}");
-                            if (v > max) {
-                                max = v;
+                            Console.WriteLine($"  {h.HardwareType} | {s.SensorType} | {s.Name}: {v:F1}");
+                        }
+
+                        if (h.HardwareType == HardwareType.Cpu) {
+                            // Temperature sensors - capture all relevant ones
+                            if (s.SensorType == SensorType.Temperature) {
+                                var v = s.Value ?? 0;
+
+                                // Intel: "CPU Package" is the main package temp
+                                // AMD: "Core (Tctl/Tdie)" is the main temp
+                                if (s.Name == "CPU Package" || s.Name == "Core (Tctl/Tdie)") {
+                                    cpuPackageTemp = v;
+                                }
+                                // "Core Max" - hottest individual core
+                                else if (s.Name == "Core Max") {
+                                    cpuCoreMax = v;
+                                }
+                                // AMD: hottest CCD - this is what PBO actually targets
+                                // LHM names vary: "CPU CCD Max", "CCDs Max (Tdie)"
+                                else if (s.Name == "CPU CCD Max" || s.Name == "CCDs Max (Tdie)") {
+                                    cpuCcdMax = v;
+                                }
+                                // AMD: pre-calculated CCD average
+                                // LHM names vary: "CPU CCD Average", "CCDs Average (Tdie)"
+                                else if (s.Name == "CPU CCD Average" || s.Name == "CCDs Average (Tdie)") {
+                                    cpuCcdAvg = v;
+                                }
+                                // Individual core temps (Intel: "Core #0", "Core #1", etc.)
+                                else if (s.Name.StartsWith("Core #")) {
+                                    cpuCoreTemps.Add(v);
+                                }
+                                // AMD: individual CCD temps
+                                // LHM names vary: "CPU CCD #1" or "CCD1 (Tdie)"
+                                else if (s.Name.StartsWith("CPU CCD #") ||
+                                         (s.Name.StartsWith("CCD") && s.Name.Length > 3 && char.IsDigit(s.Name[3]))) {
+                                    cpuCcdTemps.Add(v);
+                                }
+                            }
+                            // Clock sensors - collect per-core clocks
+                            // LHM names vary: "CPU Core #1" or "Core #1" (exclude "Effective" variants)
+                            else if (s.SensorType == SensorType.Clock &&
+                                     (s.Name.StartsWith("CPU Core #") ||
+                                      (s.Name.StartsWith("Core #") && !s.Name.Contains("Effective")))) {
+                                var v = s.Value ?? 0;
+                                if (v > 0) cpuClocks.Add(v);
+                            }
+                            // Total CPU load
+                            else if (s.SensorType == SensorType.Load && s.Name == "CPU Total") {
+                                cpuTotalLoad = s.Value ?? 0;
+                            }
+                            // CPU package power for secondary fan trigger
+                            // LHM names vary: "CPU Package" or "Package"
+                            else if (s.SensorType == SensorType.Power && (s.Name == "CPU Package" || s.Name == "Package")) {
+                                cpuPackagePower = s.Value ?? 0;
+                            }
+                        }
+                        // Track GPU metrics
+                        else if (h.HardwareType == HardwareType.GpuNvidia || h.HardwareType == HardwareType.GpuAmd || h.HardwareType == HardwareType.GpuIntel) {
+                            var v = s.Value ?? 0;
+                            if (s.SensorType == SensorType.Temperature) {
+                                // Track hottest GPU temp
+                                if (v > gpuTemp) {
+                                    gpuTemp = v;
+                                    gpuTempSource = $"{h.HardwareType}/{s.Name}";
+                                }
+                            }
+                            else if (s.SensorType == SensorType.Clock && s.Name == "GPU Core") {
+                                gpuCoreClock = v;
+                            }
+                            else if (s.SensorType == SensorType.Load && s.Name == "GPU Core") {
+                                gpuCoreLoad = v;
                             }
                         }
                     }
                 }
 
-                Console.WriteLine($"{max}");
+                // Select CPU temp with priority
+                // AMD: prefer CCD Max — this is the actual die temp PBO targets.
+                // CPU Package/Tctl reads 2-3°C higher due to IOD thermal contribution,
+                // which causes the fan curve to overshoot relative to PBO's thermal limit.
+                // Intel: fall back to CPU Package (no CCD sensors available).
+                float cpuTemp = 0;
+                if (cpuCcdMax.HasValue) {
+                    cpuTemp = cpuCcdMax.Value;
+                    cpuTempSource = "CCD Max";
+                } else if (cpuCcdTemps.Count > 0) {
+                    cpuTemp = cpuCcdTemps.Max();
+                    cpuTempSource = $"Max of {cpuCcdTemps.Count} CCDs";
+                } else if (cpuPackageTemp.HasValue) {
+                    cpuTemp = cpuPackageTemp.Value;
+                    cpuTempSource = "CPU Package";
+                } else if (cpuCoreTemps.Count > 0) {
+                    cpuTemp = cpuCoreTemps.Average();
+                    cpuTempSource = $"Avg of {cpuCoreTemps.Count} cores";
+                } else if (cpuCoreMax.HasValue) {
+                    cpuTemp = cpuCoreMax.Value;
+                    cpuTempSource = "Core Max (fallback)";
+                }
+
+                // Use the higher of CPU or GPU temp for fan control
+                float reportedTemp = Math.Max(cpuTemp, gpuTemp);
+
+                // Calculate average CPU clock and track max observed
+                float avgCpuClock = cpuClocks.Count > 0 ? cpuClocks.Average() : 0;
+
+                // Track burst max (includes single-core boost)
+                if (avgCpuClock > maxBurstCpuClock) {
+                    maxBurstCpuClock = avgCpuClock;
+                }
+                if (gpuCoreClock > maxBurstGpuClock) {
+                    maxBurstGpuClock = gpuCoreClock;
+                }
+
+                // Track sustained max (only during high load - better for PBO)
+                // This is the relevant max for detecting thermal throttling
+                if (cpuTotalLoad >= 80 && avgCpuClock > maxSustainedCpuClock) {
+                    maxSustainedCpuClock = avgCpuClock;
+                }
+                if (gpuCoreLoad >= 80 && gpuCoreClock > maxSustainedGpuClock) {
+                    maxSustainedGpuClock = gpuCoreClock;
+                }
+
+                // Use sustained max for throttle detection, fall back to burst max if no sustained data yet
+                float cpuMaxForThrottle = maxSustainedCpuClock > 0 ? maxSustainedCpuClock : maxBurstCpuClock;
+                float gpuMaxForThrottle = maxSustainedGpuClock > 0 ? maxSustainedGpuClock : maxBurstGpuClock;
+
+                if (debugMode) {
+                    Console.WriteLine($"CPU temp: {cpuTemp:F1}C (from {cpuTempSource})");
+                    Console.WriteLine($"  Package: {cpuPackageTemp?.ToString("F1") ?? "N/A"}C, CCD Max: {cpuCcdMax?.ToString("F1") ?? "N/A"}C, Core Max: {cpuCoreMax?.ToString("F1") ?? "N/A"}C, CCD Avg: {cpuCcdAvg?.ToString("F1") ?? "N/A"}C");
+                    Console.WriteLine($"  Core temps: [{string.Join(", ", cpuCoreTemps.Select(t => $"{t:F1}"))}]");
+                    Console.WriteLine($"CPU clock: {avgCpuClock:F0} MHz (sustained max: {maxSustainedCpuClock:F0}, burst max: {maxBurstCpuClock:F0})");
+                    Console.WriteLine($"CPU load: {cpuTotalLoad:F1}%");
+                    Console.WriteLine($"CPU power: {cpuPackagePower:F1}W");
+                    Console.WriteLine($"GPU temp: {gpuTemp:F1}C from {gpuTempSource}");
+                    Console.WriteLine($"GPU clock: {gpuCoreClock:F0} MHz (sustained max: {maxSustainedGpuClock:F0}, burst max: {maxBurstGpuClock:F0})");
+                    Console.WriteLine($"GPU load: {gpuCoreLoad:F1}%");
+                    Console.WriteLine($"REPORTED: {reportedTemp:F1}C");
+                } else {
+                    // Output JSON for extended parsing (use invariant culture for consistent number formatting)
+                    // cpu_max_clock uses sustained max (during high load) for better PBO-aware throttle detection
+                    Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "{{\"temp\":{0:F2},\"cpu_temp\":{1:F2},\"cpu_clock\":{2},\"cpu_max_clock\":{3},\"cpu_load\":{4:F2},\"cpu_power\":{5:F2},\"gpu_temp\":{6:F2},\"gpu_clock\":{7},\"gpu_max_clock\":{8},\"gpu_load\":{9:F2}}}",
+                        reportedTemp, cpuTemp, (int)avgCpuClock, (int)cpuMaxForThrottle, cpuTotalLoad, cpuPackagePower,
+                        gpuTemp, (int)gpuCoreClock, (int)gpuMaxForThrottle, gpuCoreLoad));
+                }
             }
         }
     }
